@@ -125,6 +125,12 @@ export interface MainToWorker_ChildOutput {
   data: string;
 }
 
+export interface MainToWorker_ChildModuleLoad {
+  type: "child-module-load";
+  requestId: number;
+  path: string;
+}
+
 export interface MainToWorker_ChildExit {
   type: "child-exit";
   requestId: number;
@@ -192,6 +198,7 @@ export type MainToWorkerMessage =
   | MainToWorker_VFSChunk
   | MainToWorker_SpawnResult
   | MainToWorker_ChildOutput
+  | MainToWorker_ChildModuleLoad
   | MainToWorker_ChildExit
   | MainToWorker_HttpRequest
   | MainToWorker_HttpClientResponse
@@ -219,6 +226,11 @@ export interface WorkerToMain_Stdout {
 export interface WorkerToMain_Stderr {
   type: "stderr";
   data: string;
+}
+
+export interface WorkerToMain_ModuleLoad {
+  type: "module-load";
+  path: string;
 }
 
 export interface WorkerToMain_Exit {
@@ -419,6 +431,7 @@ export type WorkerToMainMessage =
   | WorkerToMain_ProbeReady
   | WorkerToMain_Stdout
   | WorkerToMain_Stderr
+  | WorkerToMain_ModuleLoad
   | WorkerToMain_Exit
   | WorkerToMain_Console
   | WorkerToMain_VFSWrite

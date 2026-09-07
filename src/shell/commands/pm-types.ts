@@ -5,6 +5,12 @@ import type { ShellCommand, ShellResult, ShellContext } from "../shell-types";
 
 export type PkgManager = "npm" | "pnpm" | "yarn" | "bun";
 
+export interface NodeWatchOptions {
+  enabled: boolean;
+  paths?: string[];
+  preserveOutput?: boolean;
+}
+
 export interface PmDeps {
   installPackages: (
     args: string[],
@@ -39,7 +45,7 @@ export interface PmDeps {
     filePath: string,
     args: string[],
     ctx: ShellContext,
-    opts?: { isFork?: boolean },
+    opts?: { isFork?: boolean; watch?: NodeWatchOptions },
   ) => Promise<ShellResult>;
   evalCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;
   printCode: (code: string, ctx: ShellContext) => Promise<ShellResult>;

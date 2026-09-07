@@ -19,6 +19,9 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
       let evalCode: string | null = null;
       let printCode: string | null = null;
       let checkOnly = false;
+      let watchEnabled = false;
+      let watchPreserveOutput = false;
+      const watchPaths: string[] = [];
       const scriptArgs: string[] = [];
       let collectingArgs = false;
 
@@ -33,11 +36,25 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
           printCode = params[++i] ?? "";
         } else if (params[i] === "--check" || params[i] === "-c") {
           checkOnly = true;
+        } else if (params[i] === "--watch") {
+          watchEnabled = true;
+        } else if (params[i] === "--watch-preserve-output") {
+          watchPreserveOutput = true;
+        } else if (params[i] === "--watch-path") {
+          const watchPath = params[++i];
+          if (watchPath) watchPaths.push(watchPath);
+          watchEnabled = true;
+        } else if (params[i].startsWith("--watch-path=")) {
+          watchPaths.push(params[i].slice("--watch-path=".length));
+          watchEnabled = true;
         } else if (params[i] === "--version" || params[i] === "-v") {
           return { stdout: VERSIONS.NODE + "\n", stderr: "", exitCode: 0 };
         } else if (params[i] === "--help" || params[i] === "-h") {
           return {
-            stdout: `${A_BOLD}Usage:${A_RESET} node [options] [script.js] [arguments]\n`,
+            stdout: `${A_BOLD}Usage:${A_RESET} node [options] [script.js] [arguments]\n` +
+              `  --watch                 restart when entry/dependencies change\n` +
+              `  --watch-path <path>     restart when the given path changes\n` +
+              `  --watch-preserve-output keep output between restarts\n`,
             stderr: "",
             exitCode: 0,
           };
@@ -55,6 +72,14 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
           target = params[i];
           collectingArgs = true;
         }
+      }
+
+      if (watchEnabled && (evalCode !== null || printCode !== null || checkOnly)) {
+        return {
+          stdout: "",
+          stderr: "node: --watch cannot be combined with --eval, --print, or --check\n",
+          exitCode: 9,
+        };
       }
 
       if (evalCode !== null) {
@@ -107,7 +132,17 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
         }
       }
 
-      return deps.executeNodeBinary(target, scriptArgs, ctx);
+      return deps.executeNodeBinary(target, scriptArgs, ctx,
+        watchEnabled
+          ? {
+              watch: {
+                enabled: true,
+                paths: watchPaths.length > 0 ? watchPaths : undefined,
+                preserveOutput: watchPreserveOutput,
+              },
+            }
+          : undefined,
+      );
     },
   };
 }

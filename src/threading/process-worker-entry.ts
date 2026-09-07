@@ -55,6 +55,7 @@ let _rows = 24;
 
 const _spawnCallbacks = new Map<number, (result: any) => void>();
 const _childOutputCallbacks = new Map<number, (stream: string, data: string) => void>();
+const _childModuleCallbacks = new Map<number, (path: string) => void>();
 const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
 let _nextRequestId = 1;
@@ -135,6 +136,10 @@ function postStdout(data: string): void {
 
 function postStderr(data: string): void {
   post({ type: "stderr", data });
+}
+
+function postModuleLoad(path: string): void {
+  post({ type: "module-load", path });
 }
 
 function postExit(exitCode: number, stdout: string, stderr: string): void {
@@ -222,11 +227,17 @@ self.addEventListener("message", (ev: MessageEvent) => {
       if (cb) cb(msg.stream, msg.data);
       break;
     }
+    case "child-module-load": {
+      const cb = _childModuleCallbacks.get(msg.requestId);
+      if (cb) cb(msg.path);
+      break;
+    }
     case "child-exit": {
       const cb = _childExitCallbacks.get(msg.requestId);
       if (cb) {
         _childExitCallbacks.delete(msg.requestId);
         _childOutputCallbacks.delete(msg.requestId);
+        _childModuleCallbacks.delete(msg.requestId);
         cb(msg.exitCode, msg.stdout, msg.stderr);
       }
       break;
@@ -607,6 +618,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     const result = await shell.executeNodeBinary(filePath, args, ctx, {
       isFork: !!msg.isFork,
       workerThreadsOverride,
+      onModuleLoad: postModuleLoad,
     });
 
     shell.clearStreamingCallbacks();
@@ -1106,6 +1118,7 @@ export function spawnChild(
     stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    onModuleLoad?: (path: string) => void;
   },
 ): import("../polyfills/child_process").SpawnChildOperation {
   const requestId = _nextRequestId++;
@@ -1128,6 +1141,9 @@ export function spawnChild(
           opts?.onStderr?.(data);
         }
       });
+      if (opts?.onModuleLoad) {
+        _childModuleCallbacks.set(requestId, opts.onModuleLoad);
+      }
 
       _childExitCallbacks.set(requestId, (exitCode: number, fullStdout: string, fullStderr: string) => {
         resolve({

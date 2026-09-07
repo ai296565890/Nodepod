@@ -19,7 +19,7 @@ import {
 } from "../helpers/event-loop";
 import { createProcessContext, getActiveContext, setActiveContext } from "../threading/process-context";
 import type { ProcessContext } from "../threading/process-context";
-import type { PmDeps, PkgManager } from "../shell/commands/pm-types";
+import type { PmDeps, PkgManager, NodeWatchOptions } from "../shell/commands/pm-types";
 import type { ShellOptions } from "../shell/shell-options";
 import { createNpmCommand } from "../shell/commands/npm";
 import { createPnpmCommand } from "../shell/commands/pnpm";
@@ -56,6 +56,8 @@ let _vol: MemoryVolume | null = null;
 // would bump the refed count.
 const _nativeSetTimeout: typeof globalThis.setTimeout =
   globalThis.setTimeout.bind(globalThis);
+const _nativeClearTimeout: typeof globalThis.clearTimeout =
+  globalThis.clearTimeout.bind(globalThis);
 
 let _syncChannel: SyncChannelWorker | null = null;
 let _sabEnabled = true;
@@ -205,6 +207,7 @@ export type SpawnChildCallback = (
     stdio?: "pipe" | "inherit";
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    onModuleLoad?: (path: string) => void;
   },
 ) => SpawnChildOperation;
 
@@ -393,8 +396,224 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
 
 // node -e / -p helpers (used by PmDeps)
 
-async function executeShellNodeBinary(filePath: string, args: string[], ctx: ShellContext): Promise<ShellResult> {
-  if (!_spawnChildFn) return executeNodeBinary(filePath, args, ctx);
+const NODE_WATCH_RESTART_DEBOUNCE_MS = 50;
+
+function normalizeNodeWatchPath(raw: string, cwd: string): string {
+  const joined = raw.startsWith("/") ? raw : `${cwd}/${raw}`;
+  const parts: string[] = [];
+  for (const part of joined.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return "/" + parts.join("/");
+}
+
+function resolveNodeWatchEntry(filePath: string, ctx: ShellContext): string | null {
+  const rawPath = normalizeNodeWatchPath(filePath, ctx.cwd);
+  const vol = ctx.volume;
+  try {
+    if (vol.existsSync(rawPath) && !vol.statSync(rawPath).isDirectory()) return rawPath;
+  } catch { /* continue with Node-style extension resolution */ }
+
+  for (const ext of [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]) {
+    const candidate = rawPath + ext;
+    try {
+      if (vol.existsSync(candidate) && !vol.statSync(candidate).isDirectory()) return candidate;
+    } catch { /* keep trying */ }
+  }
+
+  const dir = rawPath.endsWith("/") ? rawPath.slice(0, -1) : rawPath;
+  for (const idx of ["index.js", "index.mjs", "index.ts", "index.cjs"]) {
+    const candidate = `${dir}/${idx}`.replace(/\/+/g, "/");
+    try {
+      if (vol.existsSync(candidate) && !vol.statSync(candidate).isDirectory()) return candidate;
+    } catch { /* keep trying */ }
+  }
+  return null;
+}
+
+/**
+ * Node-style watch supervisor. The watched dependency set is populated by the
+ * actual ScriptEngine module loader in the child process, so conditional
+ * require()/import() calls are tracked once they are really loaded.
+ */
+export async function executeNodeWatch(
+  filePath: string,
+  args: string[],
+  ctx: ShellContext,
+  watch: NodeWatchOptions,
+): Promise<ShellResult> {
+  if (!_spawnChildFn) {
+    return {
+      stdout: "",
+      stderr: "node: --watch requires process-worker support in this runtime\n",
+      exitCode: 1,
+    };
+  }
+
+  const entry = resolveNodeWatchEntry(filePath, ctx);
+  if (!entry) {
+    return {
+      stdout: "",
+      stderr: `Cannot locate module '${normalizeNodeWatchPath(filePath, ctx.cwd)}'\n`,
+      exitCode: 1,
+    };
+  }
+
+  const explicitPaths = (watch.paths ?? []).map((p) => normalizeNodeWatchPath(p, ctx.cwd));
+  const useExplicitPaths = explicitPaths.length > 0;
+  let watchedModules = new Set<string>([entry]);
+  let current: SpawnChildOperation | null = null;
+  let currentGeneration = 0;
+  let stopped = false;
+  let restarting = false;
+  let restartQueued = false;
+  let restartTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const stdoutSink = getStdoutSink();
+  const stderrSink = getStderrSink();
+  const emitOut = (text: string) => {
+    if (stdoutSink) stdoutSink(text);
+  };
+  const emitErr = (text: string) => {
+    if (stderrSink) stderrSink(text);
+  };
+
+  const isRelevantChange = (changed: string): boolean => {
+    if (useExplicitPaths) {
+      return explicitPaths.some((target) =>
+        changed === target || changed.startsWith(target.endsWith("/") ? target : target + "/"),
+      );
+    }
+    return watchedModules.has(changed);
+  };
+
+  const waitForOperation = async (op: SpawnChildOperation): Promise<void> => {
+    try {
+      await op;
+    } catch {
+      // A killed worker can reject instead of resolving; restart semantics are
+      // the same either way.
+    }
+  };
+
+  const startChild = (): void => {
+    if (stopped) return;
+    const generation = ++currentGeneration;
+
+    const operation = _spawnChildFn!("node", [entry, ...args], {
+      cwd: ctx.cwd,
+      env: ctx.env,
+      stdio: "inherit",
+      onStdout: stdoutSink ?? undefined,
+      onStderr: stderrSink ?? undefined,
+      onModuleLoad: (loadedPath) => {
+        if (stopped || useExplicitPaths || generation !== currentGeneration) return;
+        watchedModules.add(normalizeNodeWatchPath(loadedPath, ctx.cwd));
+      },
+    });
+    current = operation;
+
+    void operation.then(
+      () => {
+        if (current !== operation) return;
+        current = null;
+        if (!stopped && !restarting && !restartQueued) {
+          emitOut(`Completed running '${filePath}'. Waiting for file changes before restarting...\n`);
+        }
+      },
+      (error) => {
+        if (current !== operation) return;
+        current = null;
+        if (!stopped && !restarting && !restartQueued) {
+          emitErr(`node: ${error instanceof Error ? error.message : String(error)}\n`);
+          emitOut(`Completed running '${filePath}'. Waiting for file changes before restarting...\n`);
+        }
+      },
+    );
+  };
+
+  const restart = async (): Promise<void> => {
+    if (stopped) return;
+    if (restarting) {
+      restartQueued = true;
+      return;
+    }
+
+    restarting = true;
+    restartQueued = false;
+    if (!watch.preserveOutput) emitOut("\x1b[2J\x1b[H");
+    emitOut(`Restarting '${filePath}'\n`);
+
+    const old = current;
+    if (old) {
+      old.kill?.("SIGTERM");
+      await waitForOperation(old);
+      if (current === old) current = null;
+    }
+
+    if (!stopped) startChild();
+    restarting = false;
+
+    if (restartQueued && !stopped) {
+      restartQueued = false;
+      void restart();
+    }
+  };
+
+  const scheduleRestart = (): void => {
+    if (stopped) return;
+    restartQueued = true;
+    if (restartTimer) _nativeClearTimeout(restartTimer);
+    restartTimer = _nativeSetTimeout(() => {
+      restartTimer = null;
+      if (!restartQueued || stopped) return;
+      restartQueued = false;
+      void restart();
+    }, NODE_WATCH_RESTART_DEBOUNCE_MS);
+  };
+
+  const watcher = ctx.volume.watch("/", { recursive: true }, (_event, filename) => {
+    if (!filename || stopped) return;
+    const changed = normalizeNodeWatchPath(filename.startsWith("/") ? filename : `/${filename}`, "/");
+    if (isRelevantChange(changed)) scheduleRestart();
+  });
+
+  startChild();
+
+  await new Promise<void>((resolve) => {
+    const signal = ctx.signal;
+    if (!signal) return; // watch mode intentionally stays alive until signalled
+    if (signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+
+  stopped = true;
+  currentGeneration++;
+  if (restartTimer) {
+    _nativeClearTimeout(restartTimer);
+    restartTimer = null;
+  }
+  watcher.close();
+  const active = current as SpawnChildOperation | null;
+  current = null;
+  if (active) {
+    active.kill?.("SIGTERM");
+    await waitForOperation(active);
+  }
+
+  return { stdout: "", stderr: "", exitCode: ctx.signal?.aborted ? 130 : 0 };
+}
+
+async function executeShellNodeBinary(
+  filePath: string,
+  args: string[],
+  ctx: ShellContext,
+  opts?: ExecuteNodeBinaryOptions,
+): Promise<ShellResult> {
+  if (opts?.watch?.enabled) return executeNodeWatch(filePath, args, ctx, opts.watch);
+  if (!_spawnChildFn) return executeNodeBinary(filePath, args, ctx, opts);
   // package scripts run Node binaries in a dedicated worker. stream output and
   // inherit stdin so long-running interactive CLIs behave like local processes.
   const stdoutSink = getStdoutSink();
@@ -1200,19 +1419,23 @@ async function npmCi(
 
 // Direct node binary execution (shared by node command & npx)
 
+export interface ExecuteNodeBinaryOptions {
+  isFork?: boolean;
+  workerThreadsOverride?: {
+    isMainThread: boolean;
+    parentPort: unknown;
+    workerData: unknown;
+    threadId: number;
+  };
+  onModuleLoad?: (path: string) => void;
+  watch?: NodeWatchOptions;
+}
+
 export async function executeNodeBinary(
   filePath: string,
   args: string[],
   ctx: ShellContext,
-  opts?: {
-    isFork?: boolean;
-    workerThreadsOverride?: {
-      isMainThread: boolean;
-      parentPort: unknown;
-      workerData: unknown;
-      threadId: number;
-    };
-  },
+  opts?: ExecuteNodeBinaryOptions,
 ): Promise<ShellResult> {
   if (!_vol) return { stdout: "", stderr: "Volume unavailable\n", exitCode: 1 };
 
@@ -1345,6 +1568,7 @@ export async function executeNodeBinary(
     onStdout: pushOut,
     onStderr: pushErr,
     workerThreadsOverride: opts?.workerThreadsOverride,
+    onModuleLoad: opts?.onModuleLoad,
   });
 
   const proc = sandbox.getProcess();

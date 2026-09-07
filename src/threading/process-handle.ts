@@ -217,6 +217,10 @@ export class ProcessHandle extends EventEmitter {
           this.emit("stderr", msg.data);
           break;
 
+        case "module-load":
+          this.emit("module-load", msg.path);
+          break;
+
         case "exit": {
           if (this._readyTimer) clearTimeout(this._readyTimer);
           this._readyTimer = null;

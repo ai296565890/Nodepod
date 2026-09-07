@@ -1029,6 +1029,8 @@ export interface EngineOptions {
   /** Injected transform cache (e.g. the shared worker LRU). Takes precedence
    *  over `handler`'s cache. Must behave like Map<string, string>. */
   transformCache?: Map<string, string>;
+  /** Called whenever a file-backed module is loaded by this engine. Used by node --watch. */
+  onModuleLoad?: (filename: string) => void;
 }
 
 export interface ResolverFn {
@@ -1745,6 +1747,7 @@ function buildResolver(
     if (parentRecord) parentRecord.children.push(record);
 
     cache[resolved] = record;
+    try { opts.onModuleLoad?.(resolved); } catch { /* observer must not affect module loading */ }
 
     if (resolved.endsWith(".json")) {
       const raw = vol.readFileSync(resolved, "utf8");
@@ -2891,6 +2894,7 @@ export class ScriptEngine {
       parent: null,
     };
     this.moduleRegistry[filename] = mod;
+    try { this.opts.onModuleLoad?.(filename); } catch { /* observer must not affect execution */ }
 
     const consoleProxy = wrapConsole(this.opts.onConsole);
 
@@ -3056,6 +3060,7 @@ export class ScriptEngine {
       parent: null,
     };
     this.moduleRegistry[filename] = mod;
+    try { this.opts.onModuleLoad?.(filename); } catch { /* observer must not affect execution */ }
 
     const consoleProxy = wrapConsole(this.opts.onConsole);
 

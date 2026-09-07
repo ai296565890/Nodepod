@@ -950,6 +950,15 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
+        childHandle.on("module-load", (path: string) => {
+          if (handle.workerExited) return;
+          handle.postMessage({
+            type: "child-module-load",
+            requestId: msg.requestId,
+            path,
+          });
+        });
+
         childHandle.on("stdin-raw-status", (isRaw: boolean) => {
           handle.emit("stdin-raw-status", isRaw);
         });

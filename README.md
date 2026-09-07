@@ -148,3 +148,17 @@ No private email address is published for sponsor listings.
 Nodepod is source-available under the MIT License with the Commons Clause. The
 repository [LICENSE](./LICENSE) is authoritative; documentation and marketing
 summaries do not replace its terms.
+
+## Node watch mode compatibility patch
+
+This source package includes a NodePod watch-mode implementation for standard Node CLI workflows:
+
+```bash
+node --watch app.js
+node --watch --watch-preserve-output app.js
+node --watch-path src app.js
+```
+
+The default `--watch` mode tracks the entry file and file-backed modules actually loaded through the ScriptEngine (`require`, static imports transformed by NodePod, and dynamic imports once loaded). A matching VFS change terminates the current process worker and starts a fresh one, instead of merely clearing a module cache. Ctrl+C/SIGTERM closes the watcher and active child process.
+
+`--watch-path` uses explicit path watching instead of dependency filtering and supports files or directories.

@@ -66,6 +66,24 @@ describe("ScriptEngine", () => {
       expect(result.exports).toBe("function");
     });
 
+    it("exposes util.formatWithOptions through node:util", () => {
+      const { engine } = createEngine();
+      const result = engine.execute(
+        'const util = require("node:util"); module.exports = [typeof util.formatWithOptions, util.formatWithOptions({ depth: 0 }, "%O", { nested: { value: 1 } })];',
+        "/index.js",
+      );
+      expect(result.exports).toEqual(["function", "{ nested: [Object] }"]);
+    });
+
+    it("exposes util.formatWithOptions through util", () => {
+      const { engine } = createEngine();
+      const result = engine.execute(
+        'const util = require("util"); module.exports = typeof util.formatWithOptions;',
+        "/index.js",
+      );
+      expect(result.exports).toBe("function");
+    });
+
     it("handles syntax errors by throwing", () => {
       const { engine } = createEngine();
       expect(() => engine.execute("const {", "/bad.js")).toThrow();

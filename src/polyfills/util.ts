@@ -2,14 +2,26 @@
 
 import { Buffer } from "./buffer";
 
-export function format(template: unknown, ...values: unknown[]): string {
+export interface InspectOptions {
+  depth?: number | null;
+  colors?: boolean;
+  [key: string]: unknown;
+}
+
+function formatInternal(
+  inspectOptions: InspectOptions,
+  template: unknown,
+  values: unknown[],
+): string {
   if (typeof template !== "string") {
     // non-string first arg: inspect all args
-    return [template, ...values].map((v) => typeof v === "string" ? v : inspect(v)).join(" ");
+    return [template, ...values]
+      .map((v) => typeof v === "string" ? v : inspect(v, inspectOptions))
+      .join(" ");
   }
 
   let idx = 0;
-  let result = template.replace(/%[sdjifoO%]/g, (token) => {
+  let result = template.replace(/%[sdjifoOc%]/g, (token) => {
     if (token === "%%") return "%";
     if (idx >= values.length) return token;
 
@@ -30,7 +42,11 @@ export function format(template: unknown, ...values: unknown[]): string {
         }
       case "%o":
       case "%O":
-        return inspect(val);
+        return inspect(val, inspectOptions);
+      case "%c":
+        // Node.js accepts %c for browser-console compatibility and ignores
+        // the corresponding CSS value.
+        return "";
       default:
         return token;
     }
@@ -39,18 +55,35 @@ export function format(template: unknown, ...values: unknown[]): string {
   // append extra args beyond what format specifiers consumed (matches Node.js)
   while (idx < values.length) {
     const v = values[idx++];
-    result += " " + (typeof v === "string" ? v : inspect(v));
+    result += " " + (typeof v === "string" ? v : inspect(v, inspectOptions));
   }
 
   return result;
 }
 
+export function format(template: unknown, ...values: unknown[]): string {
+  return formatInternal({}, template, values);
+}
+
+/**
+ * Format values using the same rules as `format()`, while forwarding the
+ * supplied options to `inspect()` for object rendering. Mirrors
+ * `node:util.formatWithOptions()`.
+ */
+export function formatWithOptions(
+  inspectOptions: InspectOptions | undefined,
+  template: unknown,
+  ...values: unknown[]
+): string {
+  return formatInternal(inspectOptions ?? {}, template, values);
+}
+
 export function inspect(
   target: unknown,
-  opts?: { depth?: number; colors?: boolean },
+  opts?: InspectOptions,
 ): string {
   const visited = new WeakSet();
-  const maxDepth = opts?.depth ?? 2;
+  const maxDepth = opts?.depth === null ? Infinity : (opts?.depth ?? 2);
 
   function render(val: unknown, level: number): string {
     if (val === null) return "null";
@@ -734,6 +767,7 @@ export const TextDecoder = globalThis.TextDecoder;
 
 export default {
   format,
+  formatWithOptions,
   inspect,
   inherits,
   _extend,

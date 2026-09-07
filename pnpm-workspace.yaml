@@ -2,4 +2,6 @@ packages:
   - website
 
 onlyBuiltDependencies:
+  - '@swc/core'
   - esbuild
+  - sharp

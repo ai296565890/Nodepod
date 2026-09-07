@@ -1,11 +1,48 @@
 import { describe, it, expect } from "vitest";
 
 import { Buffer } from "../polyfills/buffer";
-import {
+import util, {
+  format,
+  formatWithOptions,
   isBuffer,
   isDeepStrictEqual,
   types,
 } from "../polyfills/util";
+
+
+describe("util.formatWithOptions", () => {
+  it("is exposed as both a named and default export", () => {
+    expect(typeof formatWithOptions).toBe("function");
+    expect(util.formatWithOptions).toBe(formatWithOptions);
+  });
+
+  it("forwards inspect depth to %o/%O rendering", () => {
+    expect(
+      formatWithOptions({ depth: 0, colors: false }, "%O", {
+        nested: { value: 1 },
+      }),
+    ).toBe("{ nested: [Object] }");
+  });
+
+  it("forwards inspect options when the first argument is not a string", () => {
+    expect(
+      formatWithOptions({ depth: 0 }, { nested: { value: 1 } }),
+    ).toBe("{ nested: [Object] }");
+  });
+
+  it("supports depth: null as unlimited depth", () => {
+    expect(
+      formatWithOptions({ depth: null }, "%O", {
+        a: { b: { c: 1 } },
+      }),
+    ).toBe("{ a: { b: { c: 1 } } }");
+  });
+
+  it("supports the %c placeholder without leaking the style argument", () => {
+    expect(format("value%c", "color:red")).toBe("value");
+    expect(formatWithOptions({}, "value%c", "color:red")).toBe("value");
+  });
+});
 
 describe("util.isBuffer", () => {
   it("returns true only for Buffer instances", () => {

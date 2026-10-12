@@ -18,6 +18,30 @@ import {
 import { EventEmitter } from "./polyfills/events";
 import { Buffer } from "./polyfills/buffer";
 import { bytesToBase64 } from "./helpers/byte-encoding";
+import { beginForegroundActivity, noteForegroundActivity } from "./helpers/foreground-activity";
+
+// Response buffers nothing else references (just received from a process
+// worker): the preview relay may transfer them to the service worker as-is.
+const _transferable = new WeakSet<ArrayBuffer>();
+
+export function markTransferable(buf: ArrayBuffer): void {
+  _transferable.add(buf);
+}
+
+function transferableBuffer(bytes: Uint8Array): ArrayBuffer {
+  const buf = bytes.buffer;
+  if (
+    buf instanceof ArrayBuffer &&
+    _transferable.has(buf) &&
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === buf.byteLength
+  ) {
+    _transferable.delete(buf);
+    return buf;
+  }
+  // a copy (Buffer#slice would be a view over the same memory)
+  return new Uint8Array(bytes).buffer as ArrayBuffer;
+}
 import { TIMEOUTS, WS_OPCODE } from "./constants/config";
 import { createHash } from "./polyfills/crypto";
 import {
@@ -163,6 +187,7 @@ export class RequestProxy extends EventEmitter {
   private _swInitPromise: Promise<void> | null = null;
   /** global, not per-instance. last writer wins across tabs */
   private _watermarkEnabled = true;
+  private _reservedHostPaths = new Set<string>();
   /** guards pagehide/beforeunload listener registration so reinit doesn't stack them */
   private _farewellInstalled = false;
   /** server-registered etc. that fire before swReady; flushed once the port is up */
@@ -553,6 +578,20 @@ export class RequestProxy extends EventEmitter {
       script,
       token: this._swAuthToken,
     });
+  }
+
+  /**
+   * Same-origin paths the host keeps for itself: the SW never routes them
+   * (or requests made by documents at them) to a pod, even when a preview
+   * claimed an enclosing path. Entries ending in "/" are prefixes.
+   */
+  reserveHostPaths(paths: string[]): void {
+    for (const raw of paths) {
+      if (typeof raw !== "string" || !raw.startsWith("/")) continue;
+      this._reservedHostPaths.add(raw);
+    }
+    if (this._reservedHostPaths.size === 0) return;
+    this.notifySW("reserve-host-paths", { paths: [...this._reservedHostPaths] });
   }
 
   setWatermark(enabled: boolean): void {
@@ -1157,6 +1196,7 @@ export class RequestProxy extends EventEmitter {
     if (!skipCookieInject) {
       this._injectVirtualCookies(instanceId, port, url, headers);
     }
+    const answered = beginForegroundActivity();
     try {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;
       return await entry.server.dispatchRequest(method, url, headers, buf);
@@ -1168,6 +1208,8 @@ export class RequestProxy extends EventEmitter {
         headers: { "Content-Type": "text/plain" },
         body: Buffer.from(msg),
       };
+    } finally {
+      answered();
     }
   }
 
@@ -1310,6 +1352,9 @@ export class RequestProxy extends EventEmitter {
       for (const id of this._instances.keys()) {
         this.notifySW("claim-instance", { instanceId: id });
       }
+      if (this._reservedHostPaths.size > 0) {
+        this.notifySW("reserve-host-paths", { paths: [...this._reservedHostPaths] });
+      }
       for (const id of this._instances.keys()) {
         const inst = this._instances.get(id)!;
         if (inst.previewScript !== null) this._sendPreviewScriptToSW(id);
@@ -1361,6 +1406,14 @@ export class RequestProxy extends EventEmitter {
 
     this.heartbeat = setInterval(() => {
       this.channel?.port1.postMessage({ type: "keepalive" });
+      // port messages don't count as service worker activity: an idle SW
+      // was stopped (dropping its response cache and routing state) despite
+      // the heartbeat. A message event to the worker itself does count.
+      try {
+        navigator.serviceWorker?.controller?.postMessage({ type: "keepalive" });
+      } catch {
+        /* no controller right now */
+      }
     }, TIMEOUTS.SW_HEARTBEAT);
 
     this.swReady = true;
@@ -1489,6 +1542,24 @@ export class RequestProxy extends EventEmitter {
                 fallbackResp.headers.forEach((v, k) => {
                   fallbackHeaders[k] = v;
                 });
+                if (data.rawBody) {
+                  replyPort.postMessage(
+                    {
+                      type: "response",
+                      id,
+                      data: {
+                        statusCode: fallbackResp.status,
+                        statusMessage: fallbackResp.statusText || "OK",
+                        headers: fallbackHeaders,
+                        body: fallbackBody,
+                        // not the pod's: never cache it under the pod's path
+                        fromNetwork: true,
+                      },
+                    },
+                    [fallbackBody],
+                  );
+                  return;
+                }
                 const fallbackB64 = fallbackBody.byteLength > 0
                   ? bytesToBase64(new Uint8Array(fallbackBody))
                   : "";
@@ -1508,23 +1579,41 @@ export class RequestProxy extends EventEmitter {
             }
           }
 
-          let bodyB64 = "";
           // HEAD must not carry a body even if the app wrote one
-          if (method?.toUpperCase() !== "HEAD" && resp.body?.length) {
-            const bytes =
-              resp.body instanceof Uint8Array ? resp.body : new Uint8Array(0);
-            bodyB64 = bytesToBase64(bytes);
+          const bytes =
+            method?.toUpperCase() !== "HEAD" && resp.body?.length && resp.body instanceof Uint8Array
+              ? resp.body
+              : null;
+          if (data.rawBody) {
+            // the service worker takes raw bytes: hand the buffer over
+            // (transfer, no copy when it is ours to give) instead of
+            // base64-encoding it on this thread
+            const body = bytes ? transferableBuffer(bytes) : null;
+            replyPort.postMessage(
+              {
+                type: "response",
+                id,
+                data: {
+                  statusCode: resp.statusCode,
+                  statusMessage: resp.statusMessage,
+                  headers: resp.headers,
+                  body,
+                },
+              },
+              body ? [body] : [],
+            );
+          } else {
+            replyPort.postMessage({
+              type: "response",
+              id,
+              data: {
+                statusCode: resp.statusCode,
+                statusMessage: resp.statusMessage,
+                headers: resp.headers,
+                bodyBase64: bytes ? bytesToBase64(bytes) : "",
+              },
+            });
           }
-          replyPort.postMessage({
-            type: "response",
-            id,
-            data: {
-              statusCode: resp.statusCode,
-              statusMessage: resp.statusMessage,
-              headers: resp.headers,
-              bodyBase64: bodyB64,
-            },
-          });
         }
       } catch (err) {
         replyPort.postMessage({
@@ -1562,6 +1651,8 @@ export class RequestProxy extends EventEmitter {
       return;
     }
 
+    // start only: a stream can stay open for as long as the page does
+    noteForegroundActivity();
     const srv = entry.server as any;
     if (typeof srv.handleStreamingRequest === "function") {
       const buf = body ? Buffer.from(new Uint8Array(body)) : undefined;

@@ -475,6 +475,54 @@ describe("resolveDependencyTree — nested placement", () => {
     expect(tree.get("ansi-regex")?.version).toBe("5.0.1");
   });
 
+  it("nests a peer-dependent package next to the requirer's own copy of the peer", async () => {
+    // napi-rs wasm bindings: the first binding hoists wasm-runtime and its
+    // peer @emnapi/core 1.x to the root; a later binding pins core 2.x and
+    // gets it nested. wasm-runtime must then be nested beside that 2.x too,
+    // or it loads the root 1.x and the pair is incompatible.
+    const registry = makeMockRegistry({
+      "old-binding": [
+        {
+          version: "1.0.0",
+          dependencies: { "wasm-runtime": "^1.1.0", core: "^1.0.0" },
+        },
+      ],
+      "new-binding": [
+        {
+          version: "2.0.0",
+          dependencies: { "wasm-runtime": "~1.2.3", core: "2.0.0-alpha.5" },
+        },
+      ],
+      "plain-user": [
+        { version: "1.0.0", dependencies: { "wasm-runtime": "^1.2.0" } },
+      ],
+      "wasm-runtime": [
+        {
+          version: "1.2.4",
+          peerDependencies: { core: "^1.7.1 || ^2.0.0-alpha.4" },
+        },
+      ],
+      core: [{ version: "1.11.3" }, { version: "2.0.0-alpha.5" }],
+    });
+    const tree = await resolveFromManifest(
+      {
+        dependencies: {
+          "old-binding": "^1.0.0",
+          "new-binding": "^2.0.0",
+          "plain-user": "^1.0.0",
+        },
+      },
+      { registry },
+    );
+    expect(tree.get("core")?.version).toBe("1.11.3");
+    expect(tree.get("wasm-runtime")?.version).toBe("1.2.4");
+    expect(tree.get("new-binding/node_modules/core")?.version).toBe("2.0.0-alpha.5");
+    expect(tree.get("new-binding/node_modules/wasm-runtime")?.version).toBe("1.2.4");
+    // no private copy where the peers already agree
+    expect(tree.has("old-binding/node_modules/wasm-runtime")).toBe(false);
+    expect(tree.has("plain-user/node_modules/wasm-runtime")).toBe(false);
+  });
+
   it("breaks cycles without hanging", async () => {
     const registry = makeMockRegistry({
       a: [{ version: "1.0.0", dependencies: { b: "^1.0.0" } }],
@@ -482,5 +530,24 @@ describe("resolveDependencyTree — nested placement", () => {
     });
     const tree = await resolveDependencyTree("a", "^1.0.0", { registry });
     expect(tree.size).toBe(2);
+  });
+});
+
+describe("resolveDependencyTree — onResolved", () => {
+  it("reports every chosen package version as the tree resolves", async () => {
+    const registry = makeMockRegistry({
+      parent: [{ version: "1.0.0", dependencies: { child: "^2.0.0" } }],
+      child: [{ version: "2.1.0" }, { version: "3.0.0" }],
+    });
+    const seen: string[] = [];
+    const tree = await resolveDependencyTree("parent", "^1.0.0", {
+      registry,
+      onResolved: (dep) => seen.push(`${dep.name}@${dep.version} ${dep.tarballUrl}`),
+    });
+    expect(tree.size).toBe(2);
+    expect(seen.sort()).toEqual([
+      "child@2.1.0 https://registry.example/child/-/child-2.1.0.tgz",
+      "parent@1.0.0 https://registry.example/parent/-/parent-1.0.0.tgz",
+    ]);
   });
 });

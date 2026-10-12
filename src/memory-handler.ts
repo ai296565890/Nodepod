@@ -25,25 +25,29 @@ export class LRUCache<K, V> {
   }
 
   get(key: K): V | undefined {
-    if (!this._map.has(key)) return undefined;
-    const value = this._map.get(key)!;
+    const map = this._map;
+    const value = map.get(key);
+    // a stored undefined reads the same either way
+    if (value === undefined) return undefined;
     // Move to most-recently-used position
-    this._map.delete(key);
-    this._map.set(key, value);
+    map.delete(key);
+    map.set(key, value);
     return value;
   }
 
   set(key: K, value: V): void {
+    const map = this._map;
     const valueBytes = Math.max(0, this._sizeOf(value));
-    if (this._map.has(key)) {
-      this._bytes -= this._sizeOf(this._map.get(key)!);
-      this._map.delete(key);
+    const previous = map.get(key);
+    if (previous !== undefined || map.has(key)) {
+      this._bytes -= this._sizeOf(previous as V);
+      map.delete(key);
     }
-    this._map.set(key, value);
+    map.set(key, value);
     this._bytes += valueBytes;
     while (
-      (this._map.size > this._capacity || this._bytes > this._maxBytes) &&
-      this._map.size > 1
+      (map.size > this._capacity || this._bytes > this._maxBytes) &&
+      map.size > 1
     ) {
       this._evictOldest();
     }
@@ -115,6 +119,30 @@ export interface MemoryHandlerOptions {
   monitorIntervalMs?: number;
   /** Max process stdout/stderr accumulation in bytes. Default: 4194304 (4MB) */
   maxProcessOutputBytes?: number;
+  /**
+   * Keep installed package content (node_modules restored from the package
+   * cache) out of main-thread memory and read files back from the cache on
+   * demand. Needs SharedArrayBuffer (lean spawn snapshots) and the package
+   * snapshot cache. Default: false.
+   */
+  evictPackageContent?: boolean;
+  /** Package content kept in main-thread memory with evictPackageContent. Default: 128 */
+  residentContentBudgetMB?: number;
+  /**
+   * Keep node_modules files that no process has read lately deflated in
+   * main-thread memory (about 4x smaller), inflating each on its next read.
+   * Rounds run in the background: shortly after an install (compressed off
+   * the main thread, holding off while processes read packages or the
+   * preview loads a page), and otherwise once the pod has been quiet for a
+   * while. Needs lean spawn snapshots (SharedArrayBuffer). Default: true.
+   */
+  packPackageContent?: boolean;
+  /**
+   * Include dormant WASM binaries in package compression. Reduces retained
+   * binary bytes, but loading a compressed engine adds decompression time.
+   * Requires packPackageContent. Default: false.
+   */
+  packWasmContent?: boolean;
 }
 
 const DEFAULTS: Required<MemoryHandlerOptions> = {
@@ -129,6 +157,10 @@ const DEFAULTS: Required<MemoryHandlerOptions> = {
   heapWarnThresholdMB: 350,
   monitorIntervalMs: 30_000,
   maxProcessOutputBytes: 4_194_304,
+  evictPackageContent: false,
+  residentContentBudgetMB: 128,
+  packPackageContent: true,
+  packWasmContent: false,
 };
 
 /* ---- MemoryHandler ---- */

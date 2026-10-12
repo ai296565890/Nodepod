@@ -1,6 +1,6 @@
 // Version Resolver — semver parsing, range matching, and dependency tree resolution.
 
-import { RegistryClient, VersionDetail } from "./registry-client";
+import { RegistryClient, VersionDetail, type PackageMetadata } from "./registry-client";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -23,6 +23,8 @@ export interface ResolutionConfig {
   devDependencies?: boolean;
   optionalDependencies?: boolean;
   onProgress?: (msg: string) => void;
+  /** A package version was chosen for a place in the tree (it may be placed again elsewhere). */
+  onResolved?: (dep: ResolvedDependency) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -42,16 +44,28 @@ export interface SemverComponents {
 
 const SEMVER_PATTERN = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/;
 
+// A resolution compares the same version strings over and over (every sort
+// of a package's thousands of versions, every range check): parse each once.
+// The results are shared, callers only read them.
+const parsedVersions = new Map<string, SemverComponents | null>();
+const PARSED_VERSIONS_MAX = 200_000;
+
 // Returns null for unparseable strings
 export function parseSemver(raw: string): SemverComponents | null {
+  const known = parsedVersions.get(raw);
+  if (known !== undefined) return known;
   const m = raw.match(SEMVER_PATTERN);
-  if (!m) return null;
-  return {
-    major: Number(m[1]),
-    minor: Number(m[2]),
-    patch: Number(m[3]),
-    prerelease: m[4],
-  };
+  const parsed = m
+    ? {
+        major: Number(m[1]),
+        minor: Number(m[2]),
+        patch: Number(m[3]),
+        prerelease: m[4],
+      }
+    : null;
+  if (parsedVersions.size >= PARSED_VERSIONS_MAX) parsedVersions.clear();
+  parsedVersions.set(raw, parsed);
+  return parsed;
 }
 
 // Standard three-way comparison: negative if left < right, 0 if equal, positive if left > right
@@ -80,24 +94,43 @@ export function compareSemver(left: string, right: string): number {
   return 0;
 }
 
+// a prerelease's identifiers, numeric ones as numbers: sorting a package's
+// thousands of canary/rc versions compares the same prereleases many times
+const prereleaseIds = new Map<string, Array<string | number>>();
+const PRERELEASE_IDS_MAX = 50_000;
+
+function prereleaseIdsOf(prerelease: string): Array<string | number> {
+  let ids = prereleaseIds.get(prerelease);
+  if (ids === undefined) {
+    ids = prerelease.split(".").map((part) => (/^\d+$/.test(part) ? Number(part) : part));
+    if (prereleaseIds.size >= PRERELEASE_IDS_MAX) prereleaseIds.clear();
+    prereleaseIds.set(prerelease, ids);
+  }
+  return ids;
+}
+
 /** Semver prerelease identifier compare: numeric by number, else ASCII. */
 function comparePrereleaseIds(left: string, right: string): number {
-  const aParts = left.split(".");
-  const bParts = right.split(".");
+  if (left === right) return 0;
+  const aParts = prereleaseIdsOf(left);
+  const bParts = prereleaseIdsOf(right);
   const len = Math.max(aParts.length, bParts.length);
   for (let i = 0; i < len; i++) {
     if (i >= aParts.length) return -1;
     if (i >= bParts.length) return 1;
-    const aNum = /^\d+$/.test(aParts[i]);
-    const bNum = /^\d+$/.test(bParts[i]);
+    const a = aParts[i];
+    const b = bParts[i];
+    if (a === b) continue;
+    const aNum = typeof a === "number";
+    const bNum = typeof b === "number";
     if (aNum && bNum) {
-      const diff = Number(aParts[i]) - Number(bParts[i]);
+      const diff = (a as number) - (b as number);
       if (diff !== 0) return diff;
     } else if (aNum !== bNum) {
       // numeric identifiers have lower precedence than non-numeric
       return aNum ? -1 : 1;
     } else {
-      const cmp = aParts[i].localeCompare(bParts[i]);
+      const cmp = (a as string).localeCompare(b as string);
       if (cmp !== 0) return cmp;
     }
   }
@@ -271,11 +304,26 @@ export function pickBestMatch(
   available: string[],
   range: string,
 ): string | null {
-  const descending = [...available].sort((a, b) => compareSemver(b, a));
+  return pickFromDescending([...available].sort((a, b) => compareSemver(b, a)), range);
+}
+
+function pickFromDescending(descending: readonly string[], range: string): string | null {
   for (const candidate of descending) {
     if (satisfiesRange(candidate, range)) return candidate;
   }
   return null;
+}
+
+// a package's versions, highest first, sorted once per metadata document
+const descendingVersions = new WeakMap<object, readonly string[]>();
+
+function pickFromMetadata(metadata: PackageMetadata, range: string): string | null {
+  let descending = descendingVersions.get(metadata.versions);
+  if (!descending) {
+    descending = Object.keys(metadata.versions).sort((a, b) => compareSemver(b, a));
+    descendingVersions.set(metadata.versions, descending);
+  }
+  return pickFromDescending(descending, range);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +394,98 @@ export async function resolveDependencyTree(
   const client = config.registry || new RegistryClient();
   const state = createState(client, config);
 
+  await prefetchMetadata(client, [[rootName, versionRange]], config);
   await walkDependency(rootName, versionRange, state);
   return state.completed;
+}
+
+// The tree walk below decides placement in a fixed order, and much of it
+// runs one registry round trip after another (claims, edges in chunks, each
+// waiting on whole subtrees). This pass first walks the same graph by
+// name and range with many requests in flight, so the metadata is already in
+// the registry client's cache when the walk asks for it: resolution costs
+// roughly the graph's depth in round trips, with results unchanged. Failures
+// are left for the walk itself to report.
+const PREFETCH_CONCURRENCY = 24;
+
+function pickVersion(metadata: PackageMetadata, range: string): string | null {
+  if (range === "latest" || range === "*") return metadata["dist-tags"].latest ?? null;
+  if (metadata["dist-tags"][range]) return metadata["dist-tags"][range];
+  return pickFromMetadata(metadata, range);
+}
+
+function prefetchMetadata(
+  client: RegistryClient,
+  roots: Array<[string, string]>,
+  config: ResolutionConfig,
+): Promise<void> {
+  const seen = new Set<string>();
+  const queue: Array<[string, string]> = roots.slice();
+  let active = 0;
+  return new Promise<void>((resolve) => {
+    const enqueueEdges = (name: string, info: VersionDetail): void => {
+      const peerMeta = info.peerDependenciesMeta || {};
+      for (const [peer, range] of Object.entries(info.peerDependencies || {})) {
+        if (!peerMeta[peer]?.optional) queue.push([peer, range]);
+      }
+      for (const entry of Object.entries(info.dependencies || {})) queue.push(entry);
+      const optional = info.optionalDependencies || {};
+      const optNames = Object.keys(optional);
+      if (config.optionalDependencies) {
+        for (const entry of Object.entries(optional)) queue.push(entry as [string, string]);
+      } else {
+        // same selection as walkEdgesForPackage: wasm variants, or the
+        // {pkg}-wasm32-wasi / {pkg}-wasm guesses for native-only packages
+        const wasm = optNames.filter((n) => n.includes("wasm32-wasi") || n.includes("wasm"));
+        for (const n of wasm) queue.push([n, optional[n] as string]);
+        if (wasm.length === 0 && optNames.length >= 2) {
+          const platformRe = /-(darwin|linux|win32|freebsd|android|sunos)-(x64|x86|arm64|arm|ia32|s390x|ppc64|mips|riscv)/;
+          if (optNames.every((n) => platformRe.test(n))) {
+            queue.push([name + "-wasm32-wasi", "*"], [name + "-wasm", "*"]);
+          }
+        }
+      }
+    };
+    const pump = (): void => {
+      while (active < PREFETCH_CONCURRENCY && queue.length > 0) {
+        const [name, rawRange] = queue.shift()!;
+        // a spec this pass can't read is left for the walk to report
+        let fetchName: string;
+        let range: string;
+        try {
+          if (typeof rawRange !== "string") continue;
+          const alias = parseNpmAlias(rawRange);
+          fetchName = alias?.realName ?? name;
+          range = alias?.realRange ?? rawRange;
+        } catch {
+          continue;
+        }
+        const key = `${fetchName}@${range}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        active++;
+        let request: Promise<PackageMetadata>;
+        try {
+          request = client.fetchManifest(fetchName);
+        } catch (err) {
+          request = Promise.reject(err);
+        }
+        request
+          .then((metadata) => {
+            const version = pickVersion(metadata, range);
+            const info = version ? metadata.versions[version] : undefined;
+            if (info) enqueueEdges(name, info);
+          })
+          .catch(() => {})
+          .finally(() => {
+            active--;
+            pump();
+          });
+      }
+      if (active === 0 && queue.length === 0) resolve();
+    };
+    pump();
+  });
 }
 
 export async function resolveFromManifest(
@@ -372,6 +510,8 @@ export async function resolveFromManifest(
       : [];
 
   const entries = Object.entries(allDeps);
+
+  await prefetchMetadata(client, [...entries, ...optionalRoot], config);
 
   // Claim root slots for every direct manifest dep before walking transitive
   // edges or auto-installed peers. Otherwise a plugin's peer range (e.g.
@@ -552,7 +692,6 @@ async function installPackageAt(
   config.onProgress?.(`Resolving ${fetchName}@${versionConstraint}`);
 
   const metadata = await registry.fetchManifest(fetchName);
-  const allVersions = Object.keys(metadata.versions);
 
   let chosenVersion: string;
   if (versionConstraint === "latest" || versionConstraint === "*") {
@@ -560,7 +699,7 @@ async function installPackageAt(
   } else if (metadata["dist-tags"][versionConstraint]) {
     chosenVersion = metadata["dist-tags"][versionConstraint];
   } else {
-    const best = pickBestMatch(allVersions, versionConstraint);
+    const best = pickFromMetadata(metadata, versionConstraint);
     if (!best) {
       throw new Error(
         `Could not find a version of "${fetchName}" matching "${versionConstraint}"`,
@@ -580,6 +719,7 @@ async function installPackageAt(
     shasum: versionInfo.dist.shasum,
   };
   completed.set(placementKey, resolved);
+  config.onResolved?.(resolved);
 
   if (walkEdges) {
     await walkEdgesForPackage(placementKey, installName, versionInfo, state);
@@ -703,6 +843,79 @@ async function walkEdgesForPackage(
         walkOptionalSoft(childName, childRange, state, placementKey),
       ),
     );
+  }
+
+  await nestPeerConsumers(placementKey, { ...edges, ...optionalEdges }, state);
+}
+
+// Node resolution from `fromKey`: the placement key `name` resolves to, walking
+// up through each enclosing node_modules to the root.
+function visiblePlacement(
+  fromKey: string,
+  name: string,
+  completed: Map<string, ResolvedDependency>,
+): string | undefined {
+  let key = fromKey;
+  while (key) {
+    const nested = `${key}/node_modules/${name}`;
+    if (completed.has(nested)) return nested;
+    const cut = key.lastIndexOf("/node_modules/");
+    key = cut < 0 ? "" : key.slice(0, cut);
+  }
+  return completed.has(name) ? name : undefined;
+}
+
+// A dependency with peer dependencies has to see the same peers as the package
+// that depends on it. When the requirer nested its own copy of a peer (it pins
+// a version the root doesn't hold) but the dependency itself was reused from
+// higher up, the dependency would resolve the other copy: napi-rs wasm bindings
+// pin @emnapi/core 2.x while a shared @napi-rs/wasm-runtime at the root picked
+// up a root @emnapi 1.x, and the mismatched pair fails at load. npm nests the
+// dependency next to the requirer's peers in that case, and so do we.
+async function nestPeerConsumers(
+  placementKey: string,
+  edges: Record<string, string>,
+  state: TreeWalkState,
+): Promise<void> {
+  const { completed, registry } = state;
+  for (const [childName, childRange] of Object.entries(edges)) {
+    const childKey = visiblePlacement(placementKey, childName, completed);
+    if (!childKey || childKey.startsWith(`${placementKey}/node_modules/`)) continue;
+    const child = completed.get(childKey)!;
+    let info: VersionDetail | undefined;
+    try {
+      info = (await registry.fetchManifest(child.fetchName)).versions[child.version];
+    } catch {
+      continue;
+    }
+    const peers = Object.keys(info?.peerDependencies || {});
+    const mismatched = peers.some((peer) => {
+      const own = visiblePlacement(placementKey, peer, completed);
+      return own !== undefined && own !== visiblePlacement(childKey, peer, completed);
+    });
+    if (!mismatched) continue;
+
+    const nestedKey = `${placementKey}/node_modules/${childName}`;
+    const pending = state.placementPromises.get(nestedKey);
+    if (pending) {
+      await pending;
+      continue;
+    }
+    if (completed.has(nestedKey)) continue;
+    const alias = parseNpmAlias(childRange);
+    const nested = installPackageAt(
+      nestedKey,
+      alias?.realName ?? child.fetchName,
+      childName,
+      alias ? alias.realRange : child.version,
+      state,
+    );
+    state.placementPromises.set(nestedKey, nested.then(() => undefined));
+    try {
+      await nested;
+    } catch {
+      /* keep the shared copy if the nested install can't resolve */
+    }
   }
 }
 

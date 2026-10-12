@@ -284,6 +284,7 @@ export function createNapiWorkerFactory(
       workerData: workerDataVal,
       threadId: this.threadId,
       isEval,
+      argv: Array.isArray(opts?.argv) ? opts.argv.map(String) : [],
       cwd: (globalThis as any).process?.cwd?.() ?? "/",
       env,
       onMessage: (data: unknown) => self.emit("message", data),
@@ -378,6 +379,9 @@ function createRealWebWorker(
 
   if (brokerWorkerFn) {
     let unrefTimer: ReturnType<typeof setTimeout> | null = null;
+    // When the worker last sent or received a message: unref() is honored
+    // once it has been quiet for a while (see unref below)
+    let lastActivity = Date.now();
     const close = (code: number): void => {
       if (self._terminated) return;
       if (unrefTimer) clearTimeout(unrefTimer);
@@ -399,15 +403,20 @@ function createRealWebWorker(
       cwd: (globalThis as any).process?.cwd?.() ?? "/",
       env: processEnv,
       onOnline: () => {
+        lastActivity = Date.now();
         if (!self._terminated) self.emit("online");
       },
-      onMessage: (data: unknown) => self.emit("message", data),
+      onMessage: (data: unknown) => {
+        lastActivity = Date.now();
+        self.emit("message", data);
+      },
       onError: (error: Error) => self.emit("error", error),
       onExit: close,
     });
     self._handle = handle;
     self._elHandle = getRegistry().register("Worker");
     self.postMessage = (value: unknown) => {
+      lastActivity = Date.now();
       if (!self._terminated) handle.postMessage(value);
     };
     self.terminate = () => {
@@ -426,12 +435,30 @@ function createRealWebWorker(
     self.unref = () => {
       // napi-rs unrefs its bootstrap worker before Vite binds the HTTP server.
       // Delay that transition through the startup gap, then honor Node's
-      // unref semantics so one-shot native-module processes can drain.
+      // unref semantics so one-shot native-module processes can drain. The
+      // gap is bridged by activity, not by a fixed 3s from this call: the
+      // worker is let go once it has been quiet for UNREF_QUIET_MS (a build
+      // that has finished stops talking to it, so `vite build` ends right
+      // after its last output instead of up to 3s after rolldown loaded),
+      // and in any case UNREF_MAX_MS after this call.
       if (!self._terminated && !unrefTimer) {
-        unrefTimer = setTimeout(() => {
+        const UNREF_QUIET_MS = 750;
+        const UNREF_MAX_MS = 3_000;
+        const startedAt = Date.now();
+        const check = (): void => {
           unrefTimer = null;
-          (self._elHandle as Handle | null)?.unref();
-        }, 3_000);
+          if (self._terminated) return;
+          const now = Date.now();
+          const quiet = now - lastActivity;
+          const elapsed = now - startedAt;
+          if (quiet >= UNREF_QUIET_MS || elapsed >= UNREF_MAX_MS) {
+            (self._elHandle as Handle | null)?.unref();
+            return;
+          }
+          unrefTimer = setTimeout(check, Math.max(25, Math.min(UNREF_QUIET_MS - quiet, UNREF_MAX_MS - elapsed)));
+          (unrefTimer as any)?.unref?.();
+        };
+        unrefTimer = setTimeout(check, UNREF_QUIET_MS);
         (unrefTimer as any)?.unref?.();
       }
       return self;
@@ -443,6 +470,9 @@ function createRealWebWorker(
     "WASI worker broker is unavailable in this execution context",
   )));
 }
+
+// polyfills/fs's bridge helpers for this proxy (same Symbol.for key)
+const FS_PROXY_INTERNALS = Symbol.for("nodepod.fsProxyInternals");
 
 // handles one sequenced synchronous filesystem request from a brokered worker
 export function handleFsProxy(
@@ -470,15 +500,25 @@ export function handleFsProxy(
         if (typeof entry.isFile === "function" && entry.isFile()) {
           try { size = fsBridge.statSync(child).size ?? 0; } catch { /* stale entry */ }
         }
+        const isSymlink = typeof entry.isSymbolicLink === "function" ? entry.isSymbolicLink() : false;
+        // a lazily listed worker volume recreates the link itself
+        let target: string | undefined;
+        if (isSymlink) {
+          try { target = String(fsBridge.readlinkSync(child)); } catch { /* dangling or gone */ }
+        }
         return {
           name: entry.name,
           parentPath: entry.parentPath || entry.path,
           _isFile: typeof entry.isFile === "function" ? entry.isFile() : false,
           _isDir: typeof entry.isDirectory === "function" ? entry.isDirectory() : false,
-          _isSymlink: typeof entry.isSymbolicLink === "function" ? entry.isSymbolicLink() : false,
+          _isSymlink: isSymlink,
+          _target: target,
           size,
         };
       });
+    } else if (type === "readFileSync" && payload.length <= 1 && fsBridge[FS_PROXY_INTERNALS]) {
+      // the stored bytes go straight into the reply buffer: no Buffer copy
+      result = fsBridge[FS_PROXY_INTERNALS].readStoredBytes(payload[0]);
     } else {
       const fn = fsBridge[type];
       if (typeof fn !== "function") throw new Error(`fs.${type} is not a function`);
@@ -524,7 +564,7 @@ export function handleFsProxy(
     const errMsg = err?.message || String(err);
     const errCode = err?.code || "";
     const errObj = JSON.stringify({ message: errMsg, code: errCode });
-    const encoded = new TextEncoder().encode(errObj);
+    const encoded = proxyReplyEncoder.encode(errObj);
 
     Atomics.store(sab, 1, 6); // type = json/object
     Atomics.store(sab, 2, encoded.byteLength);
@@ -571,8 +611,10 @@ function getValueType(v: unknown): number {
   return 6; // json/object
 }
 
+const proxyReplyEncoder = new TextEncoder();
+
 function encodeValue(v: unknown): Uint8Array {
-  const enc = new TextEncoder();
+  const enc = proxyReplyEncoder;
   if (v === undefined || v === null) return new Uint8Array(0);
   if (typeof v === "boolean") return enc.encode(v ? "1" : "0");
   if (typeof v === "number") return enc.encode(String(v));
@@ -941,9 +983,17 @@ function __fsSyncCall(type, args, sabSize) {
   const message = { __fs__: { sab: ctrl, type: type, payload: args || [], requestId: requestId } };
   __nativePostMessage(message);
 
-  const result = Atomics.wait(ctrl, 0, -1, 30000); // 30s timeout
-  if (result === 'timed-out') {
-    throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
+  // wait until this call is answered, not just until woken: the answer to
+  // the call before can have been read before its notify came (the host
+  // notifies after storing it), and that notify then wakes this wait
+  const deadline = Date.now() + 30000; // 30s timeout
+  while (Atomics.load(ctrl, 0) === -1) {
+    const left = deadline - Date.now();
+    if (left <= 0 || Atomics.wait(ctrl, 0, -1, left) === 'timed-out') {
+      // a late answer must not land in the next call
+      if (__fsReusableSab === sab) __fsReusableSab = null;
+      throw Object.assign(new Error('fs.' + type + ' timed out (30s)'), { code: 'ETIMEDOUT' });
+    }
   }
 
   const status = Atomics.load(ctrl, 0);

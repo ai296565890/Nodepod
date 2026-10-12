@@ -1,9 +1,11 @@
 import { MemoryVolume } from "../memory-volume";
-import { DependencyInstaller } from "../packages/installer";
+import { DependencyInstaller, isPackFile } from "../packages/installer";
+import { collectBinarySnapshotParts, saveSnapshotParts } from "../persistence/binary-snapshot";
 import {
   RequestProxy,
   getProxyInstance,
   NodepodSWSetupError,
+  markTransferable,
   type IVirtualServer,
 } from "../request-proxy";
 import type { VolumeSnapshot } from "../engine-types";
@@ -36,8 +38,8 @@ import {
 import { NodepodFSClient } from "./nodepod-fs-client";
 import { SyncChannelController } from "../threading/sync-channel";
 import { MemoryHandler } from "../memory-handler";
-// Browser default host is registered by `@scelar/nodepod` (src/index.ts).
-// Headless installs its host via `@scelar/nodepod/headless` before boot.
+// Browser default host is registered by `@r1ck404/nodepod` (src/index.ts).
+// Headless installs its host via `@r1ck404/nodepod/headless` before boot.
 import { ensureRuntimeHost } from "../host/runtime-host";
 import type { HttpIngress } from "../host/types";
 import type { CompletedResponse } from "../polyfills/http";
@@ -58,6 +60,19 @@ import {
 import { NodepodProfilerImpl } from "../profiling/profiler";
 import { PreviewInspector } from "./preview-inspector";
 import { TerminalServerUrlOutputStream } from "./server-url-output";
+import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import type { IDBSnapshotCache } from "../persistence/idb-cache";
+import {
+  openWorkspacePersistence,
+  type WorkspacePersistence,
+} from "../persistence/workspace";
+import {
+  PackContentSource,
+  adoptMountedPack,
+  canPageFrom,
+} from "../persistence/pack-content-source";
+import { watchToolCaches } from "../persistence/tool-cache";
+import { createOffThreadDeflater, type OffThreadDeflater } from "../helpers/deflate-worker";
 
 let activeNodepodCount = 0;
 
@@ -133,6 +148,10 @@ export class Nodepod {
   private _performance: PerformanceTracker;
   private _instrumentationProfiler: NodepodProfilerImpl | null;
   private _httpIngress: HttpIngress | null = null;
+  private _snapshotCache: IDBSnapshotCache | null = null;
+  private _persistence: WorkspacePersistence | null = null;
+  private _unwatchToolCaches: (() => void) | null = null;
+  private _deflater: OffThreadDeflater | null = null;
   private _headless = false;
   private _rewriteTerminalUrls: boolean;
   private _terminalUrlOutputStreams = new Set<TerminalServerUrlOutputStream>();
@@ -205,6 +224,8 @@ export class Nodepod {
       );
     });
 
+    this._vfsBridge.setBroadcastTargets(() => this._processManager.hasLiveProcesses());
+
     this._processManager.setVFSBridge(this._vfsBridge);
 
     // VFS watcher broadcasts main-thread file changes to workers (needed for HMR)
@@ -236,23 +257,33 @@ export class Nodepod {
           listening: true,
           address: () => ({ port, address: "0.0.0.0", family: "IPv4" }),
           dispatchRequest: async (method, url, headers, body) => {
-            const bodyStr = body
+            // request bodies stay bytes end to end (a utf8 round trip
+            // corrupted binary uploads); the copy is transferred away
+            // (an empty body is no body, as it always was for the worker)
+            const requestBody = body
               ? typeof body === "string"
                 ? body
-                : body.toString("utf8")
+                : body.byteLength > 0
+                  ? (new Uint8Array(body).buffer as ArrayBuffer)
+                  : null
               : null;
             const result = await this._processManager.dispatchHttpRequest(
               port,
               method,
               url,
               headers,
-              bodyStr,
+              requestBody,
             );
-            // Body can be ArrayBuffer (binary) or string (text)
-            const respBody =
-              result.body instanceof ArrayBuffer
-                ? Buffer.from(new Uint8Array(result.body))
-                : Buffer.from(result.body);
+            // Body can be ArrayBuffer (binary) or string (text). The worker
+            // sent (transferred) a fresh buffer: wrap it instead of copying,
+            // and let the preview relay transfer it onward.
+            let respBody: Buffer;
+            if (result.body instanceof ArrayBuffer) {
+              markTransferable(result.body);
+              respBody = Buffer.from(result.body);
+            } else {
+              respBody = Buffer.from(result.body);
+            }
             return {
               statusCode: result.statusCode,
               statusMessage: result.statusMessage,
@@ -275,6 +306,27 @@ export class Nodepod {
   /* ---- Static factory ---- */
 
   static async boot(opts: NodepodOptions = {}): Promise<Nodepod> {
+    // undo what a failed boot already set up (e.g. the workspace lock, which
+    // would otherwise block the next boot of the same workspace)
+    const onFailure: Array<() => void> = [];
+    try {
+      return await Nodepod._boot(opts, onFailure);
+    } catch (e) {
+      for (const undo of onFailure) {
+        try {
+          undo();
+        } catch {
+          /* keep the original error */
+        }
+      }
+      throw e;
+    }
+  }
+
+  private static async _boot(
+    opts: NodepodOptions,
+    onFailure: Array<() => void>,
+  ): Promise<Nodepod> {
     const performanceTracker = new PerformanceTracker();
     const profiler = new NodepodProfilerImpl(opts.profiler);
     const stopBoot = performanceTracker.start("boot.total");
@@ -333,9 +385,62 @@ export class Nodepod {
       }
     }
 
+    // restore the saved workspace into the still-empty volume, then save
+    // every change from here on (including the `files` seed below)
+    let persistence: WorkspacePersistence | null = null;
+    let restored = false;
+    if (opts.persistence) {
+      const stopRestore = performanceTracker.start("boot.workspaceRestore");
+      try {
+        const opened = await openWorkspacePersistence(
+          volume,
+          opts.persistence,
+          host.openWorkspaceStore?.bind(host),
+        );
+        if (opened) {
+          persistence = opened.persistence;
+          restored = opened.restored;
+          onFailure.push(() => void opened.persistence.close());
+        }
+      } finally {
+        stopRestore();
+      }
+    }
+
+    // memory.evictPackageContent: installed package content lives in the
+    // package cache and is paged into main-thread memory on demand
+    let packSource: PackContentSource | null = null;
+    if (handler.options.evictPackageContent) {
+      if (!sabEnabled || opts.spawnSnapshot === "full") {
+        console.warn(
+          "[Nodepod] memory.evictPackageContent needs lean spawn snapshots (SharedArrayBuffer); package content stays in memory",
+        );
+      } else if (!canPageFrom(snapshotCache)) {
+        console.warn(
+          "[Nodepod] memory.evictPackageContent needs the package snapshot cache; package content stays in memory",
+        );
+      } else {
+        packSource = new PackContentSource(snapshotCache);
+        volume.enableEviction(packSource, handler.options.residentContentBudgetMB * 1024 * 1024);
+      }
+    }
+    // memory.packPackageContent: package files nobody reads stay deflated.
+    // A full spawn snapshot copies every file into each process, which would
+    // inflate them all on every spawn.
+    let deflater: OffThreadDeflater | null = null;
+    if (handler.options.packPackageContent && sabEnabled && opts.spawnSnapshot !== "full") {
+      deflater = createOffThreadDeflater();
+      volume.enableContentPacking({
+        ...(deflater ? { deflate: (bytes: Uint8Array) => deflater!.deflate(bytes) } : {}),
+        packWasm: handler.options.packWasmContent,
+      });
+      if (deflater) onFailure.push(() => deflater?.dispose());
+    }
+
     const packages = new DependencyInstaller(volume, {
       cwd,
       snapshotCache,
+      packSource,
       performanceTracker,
       profiler: profiler.enabled ? profiler : null,
     });
@@ -366,6 +471,50 @@ export class Nodepod {
       opts.rewriteTerminalUrls !== false,
     );
     nodepod._headless = headless;
+    nodepod._snapshotCache = snapshotCache;
+    if (snapshotCache) {
+      nodepod._unwatchToolCaches = watchToolCaches(volume, snapshotCache);
+      const cache = snapshotCache;
+      // a process's install hands its package pack over: its files are in
+      // this volume too, so it is saved from here once this thread is idle
+      // (and before packing gets to them, or the copy inflates them again)
+      nodepod._processManager.setPackSaver((key) => {
+        const release = volume.holdContentPacking();
+        const save = (): void => {
+          try {
+            if (nodepod._disposed) return;
+            void saveSnapshotParts(cache, key, collectBinarySnapshotParts(volume, isPackFile)).catch(() => {});
+          } catch {
+            /* the next install saves it */
+          } finally {
+            release();
+          }
+        };
+        const ric = (globalThis as {
+          requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+        }).requestIdleCallback;
+        if (typeof ric === "function") ric(save, { timeout: 3000 });
+        else setTimeout(save, 0);
+      });
+    }
+    nodepod._deflater = deflater;
+    nodepod._persistence = persistence;
+    if (packSource && canPageFrom(snapshotCache)) {
+      const source = packSource;
+      const cache = snapshotCache;
+      // a worker's `npm install` restored a pack and sent us all of its
+      // bytes; if our cache has the same pack, page them straight back out
+      nodepod._vfsBridge.onWorkerSnapshot((snapshot) => {
+        const key = snapshot.sourceKey;
+        if (!key) return;
+        void cache
+          .getManifest(key)
+          .then((head) => {
+            if (head) adoptMountedPack(volume, source, key, head, snapshot.manifest, snapshot.data);
+          })
+          .catch(() => {});
+      });
+    }
     profiler.setMemoryProvider(() => nodepod.memoryStats() as unknown as Record<string, unknown>);
 
     if (opts.spawnSnapshot) {
@@ -384,7 +533,9 @@ export class Nodepod {
     // embedded bundle string; fire-and-forget with embedded fallback
     ProcessManager.probeExternalWorkerBundle(opts.workerUrl).catch(() => {});
 
-    if (opts.files) {
+    const seedFiles =
+      !restored || opts.persistence?.seed === "always";
+    if (opts.files && seedFiles) {
       for (const [path, content] of Object.entries(opts.files)) {
         const dir = path.substring(0, path.lastIndexOf("/")) || "/";
         if (dir !== "/" && !volume.existsSync(dir)) {
@@ -401,6 +552,25 @@ export class Nodepod {
     for (const dir of ["/tmp", "/home"]) {
       if (!volume.existsSync(dir)) {
         volume.mkdirSync(dir, { recursive: true });
+      }
+    }
+
+    // node_modules isn't saved with the workspace; bring it back from
+    // package.json, normally straight out of the package snapshot cache
+    if (restored && persistence && opts.persistence?.autoInstall !== false) {
+      const manifestPath = (cwd === "/" ? "" : cwd) + "/package.json";
+      if (volume.existsSync(manifestPath)) {
+        const stopInstall = performanceTracker.start("boot.workspaceInstall");
+        try {
+          // same as `npm install` in the terminal, so it also reuses the
+          // package cache that install filled
+          await packages.installFromManifest(undefined, { withDevDeps: true });
+        } catch (e) {
+          // nobody can listen on nodepod.persistence before boot returns
+          console.warn("[Nodepod] reinstalling dependencies of the restored workspace failed:", e);
+        } finally {
+          stopInstall();
+        }
       }
     }
 
@@ -421,6 +591,9 @@ export class Nodepod {
       proxy.setWatermark(false);
     } else if (opts.watermark === false) {
       proxy.setWatermark(false);
+    }
+    if (opts.reservedHostPaths?.length) {
+      proxy.reserveHostPaths(opts.reservedHostPaths);
     }
 
     if (host.createHttpIngress) {
@@ -574,16 +747,24 @@ export class Nodepod {
     });
 
     proc._setSendStdin((data: string) => handle.sendStdin(data));
-    proc._setKillFn(() => handle.kill("SIGINT"));
+    // PM.kill() delivers SIGINT, escalates to SIGKILL (worker termination)
+    // when the worker does not exit on its own, kills descendants and frees
+    // server ports. A bare SIGINT is just a postMessage: if the worker's
+    // event loop is wedged the message is never read and `completion`
+    // would stay pending forever.
+    const killProcess = () => {
+      if (!this._processManager.kill(handle.pid, "SIGINT")) {
+        handle.kill("SIGKILL");
+      }
+    };
+    proc._setKillFn(killProcess);
 
     if (opts?.signal) {
-      opts.signal.addEventListener(
-        "abort",
-        () => {
-          handle.kill("SIGINT");
-        },
-        { once: true },
-      );
+      if (opts.signal.aborted) {
+        killProcess();
+      } else {
+        opts.signal.addEventListener("abort", killProcess, { once: true });
+      }
     }
 
     await new Promise<void>((resolve) => {
@@ -599,7 +780,7 @@ export class Nodepod {
       args?.length &&
       !args[0].startsWith("-");
     if (isNodeFileRun) {
-      const filePath = this._resolveCommand(cmd, args);
+      const filePath = this._resolveCommand(cmd, args, execCwd);
       handle.exec({
         type: "exec",
         filePath,
@@ -648,11 +829,12 @@ export class Nodepod {
     this._terminalUrlOutputStreams.delete(stream);
   }
 
-  private _resolveCommand(cmd: string, args?: string[]): string {
+  // a relative script path is relative to the spawn's cwd, not the pod's
+  private _resolveCommand(cmd: string, args: string[] | undefined, cwd: string): string {
     if (cmd === "node" && args?.length) {
       const filePath = args[0];
       if (filePath.startsWith("/")) return filePath;
-      return `${this._cwd}/${filePath}`.replace(/\/+/g, "/");
+      return `${cwd}/${filePath}`.replace(/\/+/g, "/");
     }
     return cmd;
   }
@@ -967,6 +1149,12 @@ export class Nodepod {
   snapshot(opts?: SnapshotOptions): Snapshot {
     this._assertActive();
     const shallow = opts?.shallow ?? true;
+    if (!shallow && this._volume.evictionEnabled) {
+      throw new Error(
+        "[Nodepod] snapshot({ shallow: false }) can't include paged-out package content " +
+          "(memory.evictPackageContent). Use a shallow snapshot; restore() reinstalls packages from package.json.",
+      );
+    }
     return this._volume.toSnapshot(
       undefined,
       shallow ? Nodepod.SHALLOW_EXCLUDE_DIRS : undefined,
@@ -977,20 +1165,38 @@ export class Nodepod {
     this._assertActive();
     const autoInstall = opts?.autoInstall ?? true;
 
-    // Swap the internal tree
-    const fresh = MemoryVolume.fromSnapshot(snapshot);
-    (this._volume as any).tree = (fresh as any).tree;
-    this._volume.rebuildIndexes();
+    // decode and trial-mount first: a snapshot that can't be loaded must
+    // throw before anything of the current filesystem is removed
+    const entries = MemoryVolume.snapshotToMountEntries(snapshot);
+    new MemoryVolume().mountEntries(entries);
+
+    // replace everything but runtime-internal state through the regular
+    // mutation paths, so workers, the SharedVFS mirror, watchers and
+    // persistence all see the new tree
+    for (const name of this._volume.readdirSync("/")) {
+      const entryPath = "/" + name;
+      if (isInternalVfsPath(entryPath)) continue;
+      this._volume.removeTreeSync(entryPath);
+    }
+    this._volume.mountEntries(entries, { notify: true });
 
     // Auto-install deps from package.json if requested and manifest exists
-    if (autoInstall && this._volume.existsSync("/package.json")) {
+    const manifestPath = (this._cwd === "/" ? "" : this._cwd) + "/package.json";
+    if (autoInstall && this._volume.existsSync(manifestPath)) {
       await this._packages.installFromManifest();
     }
   }
 
   /* ---- teardown ---- */
 
-  teardown(): void {
+  /**
+   * Release workers, servers, the SW slot and (headless) the loopback
+   * ingress. Everything synchronous happens before the first await, so
+   * un-awaited callers still get the old fire-and-forget behaviour; awaiting
+   * additionally waits for the ingress socket and its keep-alive
+   * connections to close.
+   */
+  async teardown(): Promise<void> {
     if (this._disposed) return;
     this._disposed = true;
     if (this._rewriteTerminalUrls) {
@@ -1008,9 +1214,7 @@ export class Nodepod {
     }
     const ingress = this._httpIngress;
     this._httpIngress = null;
-    if (ingress?.stop) {
-      void ingress.stop().catch(() => {});
-    }
+    const ingressStopped = ingress?.stop?.();
     // release our slot so sibling Nodepods on the same page keep working
     try {
       this._proxy.detach(this.instanceId);
@@ -1021,6 +1225,15 @@ export class Nodepod {
     this._vfsBridge.clearSharedVFS();
     this._sharedVFS = null;
     this._syncChannel = null;
+    // captures pending changes synchronously, so disposing the volume
+    // right after doesn't lose them
+    const persistenceClosed = this._persistence?.close();
+    this._unwatchToolCaches?.();
+    this._unwatchToolCaches = null;
+    this._deflater?.dispose();
+    this._deflater = null;
+    this._snapshotCache?.close();
+    this._snapshotCache = null;
     this._volume.dispose();
     this._handler.destroy();
     this._unsubscribePressure?.();
@@ -1033,6 +1246,8 @@ export class Nodepod {
       getWorkerTransformCache().clear();
       ProcessManager.disposeGlobalResources();
     }
+    await ingressStopped?.catch(() => {});
+    await persistenceClosed;
   }
 
   /* ---- Performance stats ---- */
@@ -1048,6 +1263,19 @@ export class Nodepod {
       dirCount: number;
       watcherCount: number;
       lazyResidentBytes: number;
+      /** Package files paged out of memory (memory.evictPackageContent). */
+      pagedOutFiles: number;
+      pagedOutBytes: number;
+      /** Paged-in package content currently held, bounded by the resident budget. */
+      residentPackBytes: number;
+      /** Synchronous reads that hit paged-out content (should stay 0). */
+      pagedOutSyncMisses: number;
+      /** Package files kept deflated in memory (memory.packPackageContent). */
+      packedFiles: number;
+      /** Their size, uncompressed. */
+      packedBytes: number;
+      /** What they take in memory. */
+      packedStoredBytes: number;
     };
     engine: {
       moduleCacheSize: number;
@@ -1120,6 +1348,11 @@ export class Nodepod {
   get sharedFSBuffer(): SharedArrayBuffer | null {
     this._assertActive();
     if (!this._sabEnabled) return null;
+    if (this._volume.evictionEnabled) {
+      // the mirror is filled synchronously from every file's bytes, which
+      // paged-out package content can't provide
+      throw new Error("[Nodepod] sharedFSBuffer is not available with memory.evictPackageContent");
+    }
     if (!this._sharedVFS) {
       try {
         const shared = new SharedVFSController(this._sharedVFSBufferSize);
@@ -1150,6 +1383,10 @@ export class Nodepod {
 
   get volume(): MemoryVolume {
     return this._volume;
+  }
+  /** Workspace persistence, when booted with the `persistence` option and a store was available. */
+  get persistence(): WorkspacePersistence | null {
+    return this._persistence;
   }
   /** @deprecated Main-thread engine removed for security. all code now runs in isolated Web Workers via spawn() <-- this removes fatal security flaws. */
   get engine(): never {

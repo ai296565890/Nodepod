@@ -12,7 +12,7 @@ Nodepod recreates useful Node.js development primitives with browser-native buil
 The browser entry exports `Nodepod` from [`src/index.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/index.ts). A host application creates an instance and owns its lifecycle:
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const pod = await Nodepod.boot({
   files: {
@@ -24,7 +24,7 @@ const pod = await Nodepod.boot({
 const process = await pod.spawn('node', ['index.js']);
 await process.completion;
 
-pod.teardown();
+await pod.teardown();
 ```
 
 [`src/sdk/nodepod.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod.ts) is the coordinator. It initializes the engine and host adapters, exposes public subsystems, tracks workers and virtual servers, and releases them during teardown. [`src/sdk/nodepod-fs.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-fs.ts), [`src/sdk/nodepod-process.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-process.ts), and [`src/sdk/nodepod-terminal.ts`](https://github.com/R1ck404/Nodepod/blob/main/src/sdk/nodepod-terminal.ts) provide the focused filesystem, process, and terminal surfaces.
@@ -104,17 +104,19 @@ On local loopback hosts, `previewOrigin: 'auto'` can use isolated localhost subd
 
 Setting `previewOrigin: false` retains path-based URLs. Setting `serviceWorker: false` disables navigable previews entirely but leaves programmatic requests available.
 
+With path-based URLs a preview can claim broad paths such as `/`. Host pages that live next to previews on the same origin (a runtime host document, the module URLs it loads) can be kept out of pod routing with `reservedHostPaths: ['/runtime.html', '/src/']` — exact paths, or prefixes when they end in `/`. Requests issued by a document at a reserved path go to the host as well.
+
 ## Headless execution
 
 Headless mode is the same core runtime with UI-oriented defaults turned off:
 
 ```ts
 // Browser: Web Workers, service worker off by default.
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 const browserPod = await Nodepod.boot({ headless: true });
 
 // Node.js or Bun: worker threads and loopback HTTP ingress.
-import { Nodepod as HeadlessNodepod } from '@scelar/nodepod/headless';
+import { Nodepod as HeadlessNodepod } from '@r1ck404/nodepod/headless';
 const hostPod = await HeadlessNodepod.boot();
 ```
 

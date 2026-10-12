@@ -45,9 +45,52 @@ describe("quickWasmHash", () => {
     const b = new Uint8Array([0, 0, 0, 0, 0]);
     expect(quickWasmHash(a)).not.toBe(quickWasmHash(b));
   });
+
+  describe("large binaries", () => {
+    const N = 8 * 1024 * 1024;
+    const big = (): Uint8Array => {
+      const bytes = new Uint8Array(N);
+      for (let i = 0; i < N; i++) bytes[i] = (i * 2654435761) >>> 24;
+      return bytes;
+    };
+
+    it("is deterministic for equal content, also over a subarray view", () => {
+      const a = big();
+      const b = big();
+      expect(quickWasmHash(a)).toBe(quickWasmHash(b));
+      const padded = new Uint8Array(N + 16);
+      padded.set(a, 8);
+      expect(quickWasmHash(padded.subarray(8, 8 + N))).toBe(quickWasmHash(a));
+    });
+
+    it("sees a change at either end, in the middle, and in the length", () => {
+      const base = big();
+      const key = quickWasmHash(base);
+      for (const at of [0, 1, 65535, N - 1, N - 65536]) {
+        const changed = big();
+        changed[at] ^= 0xff;
+        expect(quickWasmHash(changed), `byte ${at}`).not.toBe(key);
+      }
+      // Include bytes the former sampled hash skipped.
+      const step = Math.floor((N - 2 * 65536) / 65536);
+      const mid = big();
+      mid[65536 + step * 1000] ^= 0xff;
+      expect(quickWasmHash(mid)).not.toBe(key);
+      const betweenSamples = big();
+      betweenSamples[65537] ^= 0xff;
+      expect(quickWasmHash(betweenSamples)).not.toBe(key);
+      expect(quickWasmHash(base.subarray(0, N - 1))).not.toBe(key);
+    });
+  });
 });
 
 describe("wasmContentHash", () => {
+  it("uses the same full digest when host crypto is unavailable", async () => {
+    vi.stubGlobal("crypto", undefined);
+    const bytes = new TextEncoder().encode("abc");
+    expect(await wasmContentHash(bytes)).toBe(quickWasmHash(bytes));
+    expect(quickWasmHash(bytes)).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
   it("produces a SHA-256 hex digest when crypto.subtle exists", async () => {
     const hash = await wasmContentHash(new TextEncoder().encode("abc"));
     // Known SHA-256 of "abc"

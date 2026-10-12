@@ -2,13 +2,13 @@
 title: Headless mode
 description: Run Nodepod without terminal or preview UI in browsers, Node.js, or Bun.
 sidebar:
-  order: 5
+  order: 6
 ---
 
 ## Browser
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const pod = await Nodepod.boot({ headless: true });
 ```
@@ -18,11 +18,11 @@ Headless browser mode defaults the service worker and watermark off. Filesystem,
 ## Node.js and Bun
 
 ```ts
-import { Nodepod } from '@scelar/nodepod/headless';
+import { Nodepod } from '@r1ck404/nodepod/headless';
 
 const pod = await Nodepod.boot();
 ```
 
 The headless entry uses worker threads and exposes virtual server ingress on loopback. It does not need a browser DOM, xterm.js, or service-worker setup.
 
-Always call `pod.teardown()` in application shutdown and test cleanup.
+Always call `pod.teardown()` in application shutdown and test cleanup. It resolves once the loopback ingress has closed its listening socket and any keep-alive connections, so `await` it before binding the same port again or ending a test.

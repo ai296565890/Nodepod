@@ -25,15 +25,14 @@ export class ProcessExitSentinel extends Error {
 }
 
 export function isExitSentinel(e: unknown): boolean {
-  if (e instanceof ProcessExitSentinel) return true;
-  if (
-    e &&
-    typeof e === "object" &&
-    (e as { [EXIT_SENTINEL_BRAND]?: true })[EXIT_SENTINEL_BRAND] === true
-  ) {
-    return true;
+  if (!e || typeof e !== "object") return false;
+  try {
+    // Rejection reasons may be proxies or have getters. Inspect the data
+    // brand without invoking application accessors or replacing their error.
+    return Object.getOwnPropertyDescriptor(e, EXIT_SENTINEL_BRAND)?.value === true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 // handle types, roughly lines up with libuv resource names plus a few node extras
@@ -236,4 +235,77 @@ export function getGlobalRegistry(): HandleRegistry {
 
 export function createHandleRegistry(): HandleRegistry {
   return new RegistryImpl();
+}
+
+/**
+ * Hold a refed handle for the lifetime of `work`. Anything that settles from
+ * a browser task rather than a tracked node handle (CDN imports, WebAssembly
+ * compiles, wasm-backed engines) must go through this, or the process wait
+ * loop sees an empty registry mid-await and exits early with code 0.
+ */
+export async function withHandle<T>(type: HandleType, work: () => Promise<T>): Promise<T> {
+  const h = getRegistry().register(type);
+  try {
+    return await work();
+  } finally {
+    h.close();
+  }
+}
+
+const WASM_WORK_PATCH = Symbol.for("nodepod.wasmWorkLifetime");
+const WASM_ASYNC_APIS = ["compile", "instantiate", "compileStreaming", "instantiateStreaming"] as const;
+let _untrackedWasm = 0;
+
+/**
+ * Start WebAssembly work that must not keep the process alive: speculative
+ * cache warm-ups nobody awaits. `start` must call the API synchronously.
+ */
+export function untrackedWasm<T>(start: () => T): T {
+  _untrackedWasm++;
+  try {
+    return start();
+  } finally {
+    _untrackedWasm--;
+  }
+}
+
+/**
+ * WebAssembly.compile / instantiate (and the streaming forms) settle from a
+ * browser task that no tracked handle refs, and node keeps the process alive
+ * while V8 finishes them. Without a handle, a process whose only pending work
+ * is a compile is judged drained and exits 0 mid-await: Qwik's Vite plugin
+ * loads its optimizer with fs.readFile, then WebAssembly.compile, then
+ * instantiate, and `vite` quit before listening whenever the compile outlived
+ * the wait loop's last macrotask. Hold a WASMWork handle until each settles.
+ * Patches this realm's WebAssembly namespace: process workers only.
+ */
+export function installWasmWorkLifetime(): void {
+  if (typeof WebAssembly === "undefined") return;
+  const W = WebAssembly as unknown as Record<string, unknown>;
+  for (const name of WASM_ASYNC_APIS) {
+    const native = W[name];
+    if (typeof native !== "function" || (native as { [WASM_WORK_PATCH]?: true })[WASM_WORK_PATCH]) continue;
+    const fn = native as (...args: unknown[]) => unknown;
+    const tracked = function (this: unknown, ...args: unknown[]): unknown {
+      const result = fn.apply(this, args);
+      if (_untrackedWasm > 0 || !result || typeof (result as Promise<unknown>).then !== "function") {
+        return result;
+      }
+      const handle = getRegistry().register("WASMWork");
+      return (result as Promise<unknown>).then(
+        (value) => {
+          handle.close();
+          return value;
+        },
+        (err) => {
+          handle.close();
+          throw err;
+        },
+      );
+    };
+    Object.defineProperty(tracked, "name", { value: name });
+    Object.defineProperty(tracked, "length", { value: fn.length });
+    Object.defineProperty(tracked, WASM_WORK_PATCH, { value: true });
+    W[name] = tracked;
+  }
 }

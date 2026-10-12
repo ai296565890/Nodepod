@@ -23,6 +23,7 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
       let watchPreserveOutput = false;
       const watchPaths: string[] = [];
       const scriptArgs: string[] = [];
+      const execArgv: string[] = [];
       let collectingArgs = false;
 
       for (let i = 0; i < params.length; i++) {
@@ -58,6 +59,8 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
             stderr: "",
             exitCode: 0,
           };
+        } else if (params[i] === "--conditions" || params[i] === "-C") {
+          execArgv.push(params[i], params[++i] ?? "");
         } else if (
           params[i] === "-r" ||
           params[i] === "--require" ||
@@ -68,6 +71,7 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
           i++;
         } else if (params[i].startsWith("-")) {
           // skip unknown flags (--harmony, --inspect, etc.)
+          execArgv.push(params[i]);
         } else {
           target = params[i];
           collectingArgs = true;
@@ -132,8 +136,9 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
         }
       }
 
-      return deps.executeNodeBinary(target, scriptArgs, ctx,
-        watchEnabled
+      const executeOptions = {
+        ...(execArgv.length > 0 ? { execArgv } : {}),
+        ...(watchEnabled
           ? {
               watch: {
                 enabled: true,
@@ -141,7 +146,13 @@ export function createNodeCommand(deps: PmDeps): ShellCommand {
                 preserveOutput: watchPreserveOutput,
               },
             }
-          : undefined,
+          : {}),
+      };
+      return deps.executeNodeBinary(
+        target,
+        scriptArgs,
+        ctx,
+        Object.keys(executeOptions).length > 0 ? executeOptions : undefined,
       );
     },
   };

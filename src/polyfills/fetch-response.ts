@@ -3,9 +3,62 @@
 
 import { splitCookiesString } from "set-cookie-parser";
 import type { ServerResponse } from "./http";
+import { getRegistry } from "../helpers/event-loop";
 
 const HEADERS_PATCH = Symbol.for("nodepod.fetchHeadersSetCookieParity");
 const FETCH_CLASS_PATCH = Symbol.for("nodepod.fetchClassHeaderParity");
+const BODY_READ_PATCH = Symbol.for("nodepod.bodyReadLifetime");
+
+/**
+ * A process whose only pending work is reading a Blob or a Response/Request
+ * body (`new Blob([...]).text().then(...)`) must not be judged drained and
+ * exit before the read settles: those reads complete from browser tasks no
+ * tracked handle refs. Hold a handle for the duration of each read, as for
+ * fetch() bodies. Patches this realm's prototypes: process workers only.
+ */
+export function installBodyReadLifetime(): void {
+  // a read implemented on top of another one (node 20's Blob#text calls
+  // this.arrayBuffer()) holds one handle, not two
+  let reading = 0;
+  const hold = (proto: object | undefined, names: readonly string[]): void => {
+    if (!proto || (proto as Record<symbol, unknown>)[BODY_READ_PATCH]) return;
+    Object.defineProperty(proto, BODY_READ_PATCH, { value: true });
+    for (const name of names) {
+      const desc = Object.getOwnPropertyDescriptor(proto, name);
+      if (!desc || typeof desc.value !== "function") continue;
+      const read = desc.value as (this: unknown, ...args: unknown[]) => unknown;
+      Object.defineProperty(proto, name, {
+        ...desc,
+        value: function (this: unknown, ...args: unknown[]) {
+          if (reading > 0) return read.apply(this, args);
+          let result: unknown;
+          reading++;
+          try {
+            result = read.apply(this, args);
+          } finally {
+            reading--;
+          }
+          if (!result || typeof (result as Promise<unknown>).then !== "function") return result;
+          const handle = getRegistry().register("FetchRequest");
+          return (result as Promise<unknown>).then(
+            (value) => {
+              handle.close();
+              return value;
+            },
+            (err) => {
+              handle.close();
+              throw err;
+            },
+          );
+        },
+      });
+    }
+  };
+  const bodyReads = ["text", "json", "arrayBuffer", "blob", "bytes", "formData"] as const;
+  hold(typeof Blob === "function" ? Blob.prototype : undefined, ["text", "arrayBuffer", "bytes"]);
+  hold(typeof Response === "function" ? Response.prototype : undefined, bodyReads);
+  hold(typeof Request === "function" ? Request.prototype : undefined, bodyReads);
+}
 
 type IterableHeaders = Headers & {
   entries(): IterableIterator<[string, string]>;
@@ -187,8 +240,13 @@ export function installNodeFetchClassParity(): void {
  * realms even after Headers parity is installed.
  */
 export function patchFetchNodeAdapterExports(
-  exports: Record<string, unknown>,
+  exports: Record<string, unknown> | null | undefined,
 ): void {
+  // CommonJS modules may export null/undefined or a primitive
+  // (lodash/_coreJsData.js is one); there is nothing to patch on those.
+  if (exports == null || (typeof exports !== "object" && typeof exports !== "function")) {
+    return;
+  }
   if (
     typeof exports.getRequest === "function" &&
     typeof exports.setResponse === "function"
@@ -257,11 +315,23 @@ export function installFetchHeadersSetCookieParity(): void {
   ): Generator<[string, string], void, unknown> {
     const cookies =
       typeof this.getSetCookie === "function" ? this.getSetCookie() : [];
-    for (const cookie of cookies) {
-      yield ["set-cookie", cookie];
+    if (cookies.length > 0) {
+      for (const cookie of cookies) {
+        yield ["set-cookie", cookie];
+      }
     }
     for (const [key, value] of origEntries.call(this)) {
-      if (key.toLowerCase() === "set-cookie") continue;
+      if (key.toLowerCase() === "set-cookie") {
+        // Browser Headers has no getSetCookie(), but the guard-free Headers
+        // objects used by NodePod can still contain Set-Cookie values. Keep
+        // those values visible to server code instead of dropping them.
+        if (cookies.length === 0) {
+          for (const cookie of splitCookiesString(value)) {
+            yield ["set-cookie", cookie];
+          }
+        }
+        continue;
+      }
       yield [key, value];
     }
   }
@@ -291,7 +361,10 @@ export function installFetchHeadersSetCookieParity(): void {
     if (name.toLowerCase() === "set-cookie") {
       const cookies =
         typeof this.getSetCookie === "function" ? this.getSetCookie() : [];
-      return cookies.length > 0 ? cookies.join(", ") : null;
+      if (cookies.length > 0) return cookies.join(", ");
+      // Fall back to the native Headers store for browser realms where
+      // getSetCookie() is unavailable but NodePod created a guard-free list.
+      return origGet.call(this, name);
     }
     return origGet.call(this, name);
   };

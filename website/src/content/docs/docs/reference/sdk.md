@@ -9,16 +9,16 @@ Nodepod publishes five supported entry points.
 
 | Import | Purpose |
 | --- | --- |
-| `@scelar/nodepod` | Browser runtime, types, filesystem, terminal, packages, process, HTTP, profiling, and inspection APIs |
-| `@scelar/nodepod/headless` | Node.js, Bun, and explicitly headless runtime defaults |
-| `@scelar/nodepod/server` | Fetch-style and Node-style runtime asset response helpers |
-| `@scelar/nodepod/vite` | Vite plugin for development and production assets |
-| `@scelar/nodepod/next` | Next.js route, middleware, proxy, matcher, and asset helpers |
+| `@r1ck404/nodepod` | Browser runtime, types, filesystem, terminal, packages, process, HTTP, profiling, and inspection APIs |
+| `@r1ck404/nodepod/headless` | Node.js, Bun, and explicitly headless runtime defaults |
+| `@r1ck404/nodepod/server` | Fetch-style and Node-style runtime asset response helpers |
+| `@r1ck404/nodepod/vite` | Vite plugin for development and production assets |
+| `@r1ck404/nodepod/next` | Next.js route, middleware, proxy, matcher, and asset helpers |
 
 ## Main browser lifecycle
 
 1. Call `Nodepod.boot(options)`.
-2. Use `fs`, `packages`, `spawn()`, `request()`, `port()`, `createTerminal()`, `snapshot()`, or inspection/profiling capabilities.
+2. Use `fs`, `packages`, `spawn()`, `request()`, `port()`, `createTerminal()`, `snapshot()`, `persistence`, or inspection/profiling capabilities.
 3. Detach UI integrations.
 4. Call `teardown()`.
 

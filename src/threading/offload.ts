@@ -106,12 +106,28 @@ async function mainThreadTransformBatch(
   return { type: "transformBatch", id: task.id, results };
 }
 
+// gzip via the platform's native inflater; pako (JavaScript, several times
+// slower, with a JS CRC pass on top) only if that's missing or rejects the
+// stream (e.g. trailing bytes after the gzip member)
+async function gunzip(compressed: Uint8Array): Promise<Uint8Array> {
+  if (typeof DecompressionStream === "function") {
+    try {
+      const stream = new Blob([compressed as BlobPart])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      /* fall back below */
+    }
+  }
+  const pako = await import("pako");
+  return pako.inflate(compressed);
+}
+
 async function mainThreadExtract(
   task: ExtractTask,
 ): Promise<ExtractResult> {
-  const pako = await import("pako");
   const { parseTarArchive } = await import("../packages/archive-extractor");
-  const { bytesToBase64 } = await import("../helpers/byte-encoding");
 
   let compressed: Uint8Array;
   if (task.tarballBytes && task.tarballBytes.byteLength > 0) {
@@ -125,14 +141,25 @@ async function mainThreadExtract(
     }
     compressed = new Uint8Array(await response.arrayBuffer());
   }
-  const tarBytes = pako.inflate(compressed);
+  const tarBytes = await gunzip(compressed);
 
   const files: ExtractResult["files"] = [];
   for (const entry of parseTarArchive(tarBytes)) {
     if (entry.kind !== "file" || !entry.payload) continue;
 
     let relative = entry.filepath;
-    if (task.stripComponents > 0) {
+    if (
+      task.stripComponents === 1 &&
+      relative.charCodeAt(0) !== 47 &&
+      !relative.endsWith("/") &&
+      !relative.includes("//")
+    ) {
+      // the usual "package/..." prefix of a clean path: same result as the
+      // split below, without building the segment arrays per file
+      const slash = relative.indexOf("/");
+      if (slash === -1) continue;
+      relative = relative.slice(slash + 1);
+    } else if (task.stripComponents > 0) {
       const segments = relative.split("/").filter(Boolean);
       if (segments.length <= task.stripComponents) continue;
       relative = segments.slice(task.stripComponents).join("/");
@@ -140,7 +167,8 @@ async function mainThreadExtract(
 
     files.push({
       path: relative,
-      data: new Uint8Array(entry.payload),
+      // already a copy of its own (parseTarArchive slices every payload)
+      data: entry.payload,
       isBinary: true,
     });
   }

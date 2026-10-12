@@ -23,7 +23,7 @@
  * tab's port and you'd get "No server on {instanceId}/{port}" 503s.
  */
 
-const SW_VERSION = 20;
+const SW_VERSION = 21;
 const DEFAULT_INSTANCE = "default";
 const INTERNAL_BRIDGE_PATHS = new Set([
   "/__nodepod_bridge__.html",
@@ -34,6 +34,25 @@ const INTERNAL_BRIDGE_PATHS = new Set([
 let nextId = 1;
 // id -> { resolve, reject, port }
 const pending = new Map();
+
+// Same-origin paths the host reserves for itself (its own pages, the module
+// URLs those pages load). Never proxied, whatever the claim map says: a
+// preview that claimed "/" must not capture the document that boots the
+// host's next runtime. Exact paths, or prefixes when they end with "/".
+// Union across tabs; a tab re-sends its set on every init.
+const reservedHostPaths = new Set();
+
+function isReservedHostPath(pathname) {
+  if (reservedHostPaths.size === 0) return false;
+  for (const reserved of reservedHostPaths) {
+    if (reserved.endsWith("/")) {
+      if (pathname === reserved || pathname.startsWith(reserved)) return true;
+    } else if (pathname === reserved) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // one entry per connected tab. MessagePort ->
 // { token, instances: Set<string>, relayPort?: MessagePort }
@@ -157,12 +176,118 @@ function lookupPodForClaimedPath(pathname) {
   }
 }
 
+// pod owning the adopted preview document currently shown at `docUrl`
+// (origin + path + query, the shape a Referer header carries), or null when
+// no such client exists — e.g. the URL belongs to the host page.
+async function resolvePodForPreviewDocument(docUrl) {
+  let clients;
+  try {
+    clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  } catch {
+    return null;
+  }
+  const wanted = docUrl.origin + stripPreviewPrefix(docUrl.pathname) + docUrl.search;
+  for (const client of clients) {
+    const pod = previewClients.get(client.id);
+    if (!pod) continue;
+    let clientUrl;
+    try {
+      clientUrl = new URL(client.url);
+    } catch {
+      continue;
+    }
+    if (clientUrl.origin + stripPreviewPrefix(clientUrl.pathname) + clientUrl.search === wanted) {
+      return pod;
+    }
+  }
+  return null;
+}
+
 // A preview document navigated via an explicit /__virtual__/ or /__preview__/
 // URL. Only adopt resultingClientId (the committing document) — event.clientId
 // on iframe loads is the embedder (host app) and adopting it hijacks the host.
 function registerPreviewNavigation(resultingClientId, pod, strippedPath) {
   claimPreviewPath(strippedPath, pod);
   adoptPreviewClient(resultingClientId, pod);
+}
+
+// ── Response cache ──
+// Proxied responses carry Cache-Control: no-store to the browser, so without
+// this every reload re-requests and re-transfers every module. Responses the
+// server marks immutable (content-hashed URLs, e.g. pre-bundled deps) are
+// served from here with no round trip; responses with an ETag are
+// revalidated with If-None-Match and a 304 is answered from here. Entries
+// are per server and bounded by total bytes (LRU).
+const RESPONSE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+const RESPONSE_CACHE_MAX_ENTRY = 8 * 1024 * 1024;
+const responseCache = new Map(); // key -> entry, insertion order = recency
+let responseCacheBytes = 0;
+// bumped by every clear: a response still in flight from a server that has
+// since stopped must not repopulate the cache
+let responseCacheEpoch = 0;
+
+function responseCacheKey(instanceId, serverPort, path) {
+  return instanceId + "|" + serverPort + "|" + path;
+}
+
+function headerValue(headers, name) {
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === name) {
+      const v = headers[k];
+      return Array.isArray(v) ? v.join(", ") : v == null ? "" : String(v);
+    }
+  }
+  return "";
+}
+
+function responseCacheGet(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  responseCache.delete(key);
+  responseCache.set(key, entry);
+  return entry;
+}
+
+function responseCacheDelete(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return;
+  responseCache.delete(key);
+  responseCacheBytes -= entry.size;
+}
+
+function responseCachePut(key, entry) {
+  if (entry.size > RESPONSE_CACHE_MAX_ENTRY) return;
+  responseCacheDelete(key);
+  responseCache.set(key, entry);
+  responseCacheBytes += entry.size;
+  for (const [k, e] of responseCache) {
+    if (responseCacheBytes <= RESPONSE_CACHE_MAX_BYTES) break;
+    responseCache.delete(k);
+    responseCacheBytes -= e.size;
+  }
+}
+
+// the request's values of the headers a response varies on
+function varyValues(varyNames, headers) {
+  return varyNames.map((name) => headerValue(headers, name));
+}
+
+function varyMatches(entry, headers) {
+  if (!entry.varyNames) return true;
+  const now = varyValues(entry.varyNames, headers);
+  return now.every((v, i) => v === entry.varyValues[i]);
+}
+
+function responseCacheClear(instanceId, serverPort) {
+  responseCacheEpoch++;
+  const prefix = serverPort == null ? instanceId + "|" : instanceId + "|" + serverPort + "|";
+  for (const key of [...responseCache.keys()]) {
+    if (key.startsWith(prefix)) responseCacheDelete(key);
+  }
+}
+
+function cachedResponse(entry) {
+  return buildProxyResponse(entry.body, entry.status, entry.statusText, Object.assign({}, entry.headers));
 }
 
 function trackInstanceServer(instanceId, serverPort) {
@@ -176,6 +301,7 @@ function trackInstanceServer(instanceId, serverPort) {
 }
 
 function untrackInstanceServer(instanceId, serverPort) {
+  responseCacheClear(instanceId, serverPort);
   const set = instanceServers.get(instanceId);
   if (!set) return;
   set.delete(serverPort);
@@ -415,6 +541,21 @@ function claimInstance(mp, instanceId) {
   ports.get(mp).instances.add(instanceId);
 }
 
+// forget every routing hint that points at an instance: its path claims,
+// adopted preview clients and last-active marker. a released or reloaded
+// instance must not keep capturing paths it used to serve.
+function forgetInstanceRouting(instanceId) {
+  for (const [path, pod] of [...pathClaims]) {
+    if (pod && pod.instanceId === instanceId) pathClaims.delete(path);
+  }
+  for (const [clientId, pod] of [...previewClients]) {
+    if (pod && pod.instanceId === instanceId) previewClients.delete(clientId);
+  }
+  if (lastActivePod && lastActivePod.instanceId === instanceId) lastActivePod = null;
+  instanceServers.delete(instanceId);
+  responseCacheClear(instanceId);
+}
+
 // only release if this port still owns it. a newer tab may have reclaimed it
 function releaseInstance(mp, instanceId) {
   if (instancePorts.get(instanceId) === mp) {
@@ -422,6 +563,7 @@ function releaseInstance(mp, instanceId) {
     previewScripts.delete(instanceId);
     previewInspectorScripts.delete(instanceId);
     wsTokens.delete(instanceId);
+    forgetInstanceRouting(instanceId);
     if (
       !registeredOriginPod &&
       originPod &&
@@ -444,6 +586,7 @@ function cleanupPort(mp) {
         previewScripts.delete(id);
         previewInspectorScripts.delete(id);
         wsTokens.delete(id);
+        forgetInstanceRouting(id);
         if (
           !registeredOriginPod &&
           originPod &&
@@ -461,13 +604,27 @@ function cleanupPort(mp) {
 // Extract (instanceId, port, restPath) from a /__virtual__/... or /__preview__/... pathname.
 // Returns null if no match. Handles both the new 3-segment form and the legacy
 // 2-segment form (falls back to DEFAULT_INSTANCE).
+// compiled once per kind, not on every fetch event
+const PREVIEW_PATH_RES = {};
+function previewPathRes(kind) {
+  let res = PREVIEW_PATH_RES[kind];
+  if (!res) {
+    const prefix = kind === "virtual" ? "__virtual__" : "__preview__";
+    res = PREVIEW_PATH_RES[kind] = {
+      // New: /__{kind}__/{instanceId}/{port}[/rest]
+      // Require non-digit in first segment so we don't swallow legacy ports.
+      newRe: new RegExp(
+        "^\\/" + prefix + "\\/([A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*)\\/(\\d+)(\\/.*)?$"
+      ),
+      // Legacy: /__{kind}__/{port}[/rest]
+      oldRe: new RegExp("^\\/" + prefix + "\\/(\\d+)(\\/.*)?$"),
+    };
+  }
+  return res;
+}
+
 function matchPreviewOrVirtualPath(pathname, kind /* "virtual" | "preview" */) {
-  const prefix = kind === "virtual" ? "__virtual__" : "__preview__";
-  // New: /__{kind}__/{instanceId}/{port}[/rest]
-  // Require non-digit in first segment so we don't swallow legacy ports.
-  const newRe = new RegExp(
-    "^\\/" + prefix + "\\/([A-Za-z0-9_-]*[A-Za-z_-][A-Za-z0-9_-]*)\\/(\\d+)(\\/.*)?$"
-  );
+  const { newRe, oldRe } = previewPathRes(kind);
   const m1 = pathname.match(newRe);
   if (m1) {
     return {
@@ -476,8 +633,6 @@ function matchPreviewOrVirtualPath(pathname, kind /* "virtual" | "preview" */) {
       rest: m1[3] || "/",
     };
   }
-  // Legacy: /__{kind}__/{port}[/rest]
-  const oldRe = new RegExp("^\\/" + prefix + "\\/(\\d+)(\\/.*)?$");
   const m2 = pathname.match(oldRe);
   if (m2) {
     return {
@@ -816,8 +971,10 @@ function onPortMessage(event, mp) {
   if (!msg) return;
 
   if (msg.type === "response" && pending.has(msg.id)) {
-    const { resolve, reject } = pending.get(msg.id);
+    const { resolve, reject, timer } = pending.get(msg.id);
     pending.delete(msg.id);
+    // answered: the no-answer timeout (and what it holds) can go now
+    if (timer) clearTimeout(timer);
     if (msg.error) reject(new Error(msg.error));
     else resolve(msg.data);
     return;
@@ -833,6 +990,13 @@ function onPortMessage(event, mp) {
   }
   if (msg.type === "release-all") {
     cleanupPort(mp);
+    return;
+  }
+  if (msg.type === "reserve-host-paths" && msg.data && Array.isArray(msg.data.paths)) {
+    for (const raw of msg.data.paths) {
+      if (typeof raw !== "string" || raw.charAt(0) !== "/") continue;
+      reservedHostPaths.add(raw);
+    }
     return;
   }
 
@@ -971,6 +1135,11 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // Host-reserved infrastructure documents are always served by the host.
+  if (url.origin === self.location.origin && isReservedHostPath(url.pathname)) {
+    return;
+  }
+
   // Dedicated hostname preview: the origin itself is the routing key, so all
   // same-origin app traffic can go straight to its bound virtual server.
   if (originPod && url.origin === self.location.origin) {
@@ -1009,6 +1178,22 @@ self.addEventListener("fetch", (event) => {
       proxyToVirtualServer(request, instanceId, serverPort, path),
     );
     return;
+  }
+
+  // Requests issued by a reserved host document (its referrer is the reserved
+  // path) are the host's own module/asset loads. Explicitly prefixed preview
+  // URLs already routed above, so an embedded preview inside such a document
+  // still works.
+  if (reservedHostPaths.size > 0 && request.referrer) {
+    try {
+      const referrer = new URL(request.referrer);
+      if (
+        referrer.origin === self.location.origin &&
+        isReservedHostPath(referrer.pathname)
+      ) {
+        return;
+      }
+    } catch {}
   }
 
   // 2. only same-origin (and localhost-alias) URLs can belong to a pod;
@@ -1110,10 +1295,32 @@ self.addEventListener("fetch", (event) => {
     return; // unattributed → host
   }
 
+  const dest = request.destination;
+
+  // 6a. download from a preview document (<a download>, or a navigation the
+  //     server answers with Content-Disposition). Chrome issues these as a
+  //     navigate-mode request with an empty destination and no client of
+  //     their own, so steps 3/5 cannot see the page. The Referer is the
+  //     preview document's stripped URL: attribute through the claim map so
+  //     the bytes come from the pod instead of the host's SPA fallback.
+  //     Only a document we adopted as a preview client qualifies; the host
+  //     page shares the origin and may sit on the very same path, and its
+  //     own downloads must keep going to the host.
+  if (dest === "" && refUrl && previewClients.size > 0) {
+    event.respondWith(
+      (async () => {
+        const pod = await resolvePodForPreviewDocument(refUrl);
+        if (!pod) return fetch(request);
+        const path = stripPreviewPrefix(url.pathname) + url.search;
+        return proxyToVirtualServer(request, pod.instanceId, pod.serverPort, path, request);
+      })(),
+    );
+    return;
+  }
+
   // 6. iframe/frame document navigation at a stripped URL. top-level host
   //    navigations never match. when pathClaims is empty (SW update wiped
   //    state), fall back to resolvePodFromLiveInstances for preview reloads.
-  const dest = request.destination;
   if (dest === "iframe" || dest === "frame") {
     // live-instance recovery only when pathClaims is empty; if claims exist
     // and none match, the frame isn't a preview — let the host serve it.
@@ -1428,23 +1635,95 @@ function getLocationPatchScript(instanceId, serverPort) {
 
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('controllerchange', claimPath);
-    // A dedicated preview worker can be terminated by the browser even while
-    // its tab remains open. Its MessagePorts are disposable worker-global
-    // state, so recover through the bootstrap on the next request instead of
-    // leaving the running app stuck behind repeated synthetic 503 responses.
-    var reconnecting = false;
-    navigator.serviceWorker.addEventListener('message', function(event) {
-      if (
-        !PREFIX &&
-        !reconnecting &&
-        event.data &&
-        event.data.type === 'sw-needs-init'
-      ) {
-        reconnecting = true;
-        setTimeout(function() { location.reload(); }, 0);
-      }
+    // Browser suspension discards a worker's MessagePorts. The origin bridge
+    // reconnects them on sw-needs-init while proxyToVirtualServer waits for
+    // that handshake. Navigating here races that recovery and destroys live
+    // application state (including the first HMR update after an idle period).
+  }
+
+  // <a download> — Chrome issues anchor downloads with service workers
+  // skipped, so the request reaches the physical host (whose SPA fallback
+  // answers with its own HTML) instead of this pod's server. Neither the
+  // virtual prefix nor the hostname SW can see it. Fetch the same-origin
+  // URL ourselves (fetch() is routed through the SW), then hand the bytes
+  // to the browser as an object URL. Applies to both preview modes.
+  var NATIVE_DL = 'data-nodepod-native-download';
+  var origClick = HTMLElement.prototype.click;
+  function downloadTarget(el) {
+    if (!el || el.nodeName !== 'A' || !el.hasAttribute('download')) return null;
+    if (el.hasAttribute(NATIVE_DL)) return null;
+    var raw = el.getAttribute('href');
+    if (!raw) return null;
+    var u;
+    try { u = new URL(raw, location.href); } catch (e) { return null; }
+    if (u.origin !== location.origin) return null;
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u;
+  }
+  function filenameFor(el, u, response) {
+    var name = el.getAttribute('download');
+    if (name) return name;
+    var cd = '';
+    try { cd = response.headers.get('content-disposition') || ''; } catch (e) {}
+    var m = /filename\\*=(?:UTF-8|utf-8)''([^;]+)/.exec(cd);
+    if (m) { try { return decodeURIComponent(m[1].trim()); } catch (e) {} }
+    m = /filename="?([^";]+)"?/.exec(cd);
+    if (m) return m[1].trim();
+    var seg = u.pathname.split('/').pop();
+    return seg ? decodeURIComponent(seg) : 'download';
+  }
+  function nativeDownload(el) {
+    // fall back to the browser's own download of the original href
+    try {
+      el.setAttribute(NATIVE_DL, '1');
+      origClick.call(el);
+    } finally {
+      el.removeAttribute(NATIVE_DL);
+    }
+  }
+  function podDownload(el, u) {
+    var href = strip(u.pathname) + u.search + u.hash;
+    fetch(href, { credentials: 'include' }).then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.blob().then(function(blob) {
+        var a = document.createElement('a');
+        a.setAttribute(NATIVE_DL, '1');
+        a.href = URL.createObjectURL(blob);
+        a.download = filenameFor(el, u, res);
+        document.body.appendChild(a);
+        origClick.call(a);
+        setTimeout(function() {
+          URL.revokeObjectURL(a.href);
+          if (a.parentNode) a.parentNode.removeChild(a);
+        }, 10000);
+      });
+    }).catch(function(err) {
+      console.warn('[nodepod] download via fetch failed, using native download:', err);
+      nativeDownload(el);
     });
   }
+  document.addEventListener('click', function(ev) {
+    if (ev.defaultPrevented || ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) return;
+    var el = ev.target;
+    while (el && el.nodeName !== 'A') el = el.parentNode;
+    var u = downloadTarget(el);
+    if (!u) return;
+    ev.preventDefault();
+    podDownload(el, u);
+  });
+  // programmatic downloads usually click a detached anchor, which never
+  // bubbles to the document listener
+  try {
+    HTMLElement.prototype.click = function() {
+      var u = downloadTarget(this);
+      if (u) {
+        podDownload(this, u);
+        return;
+      }
+      return origClick.apply(this, arguments);
+    };
+  } catch (e) {}
 
   // A hostname preview already has a clean URL and its SW is explicitly bound
   // to one pod. Leave native history, links, and forms completely untouched.
@@ -1491,7 +1770,7 @@ function getLocationPatchScript(instanceId, serverPort) {
     while (el && el.nodeName !== 'A') el = el.parentNode;
     if (!el || !el.getAttribute) return;
     if (el.target && el.target !== '' && el.target !== '_self') return;
-    if (el.hasAttribute('download')) return;
+    if (el.hasAttribute('download')) return; // handled by the download interceptor above
     var raw = el.getAttribute('href');
     if (!raw || raw.charAt(0) !== '/' || raw.charAt(1) === '/') return;
     ev.preventDefault();
@@ -1642,6 +1921,19 @@ function errorPage(status, title, message) {
 
 // ── Virtual server proxy ──
 
+const DOCUMENT_DESTINATIONS = new Set(["document", "iframe", "frame", "embed", "object"]);
+
+// true for requests whose response becomes a browsing-context document, i.e.
+// where the injected location/WebSocket/timing shims can and should run.
+// fetch()/XHR have an empty destination and mode "cors"/"same-origin".
+function isDocumentRequest(request) {
+  if (!request) return false;
+  if (DOCUMENT_DESTINATIONS.has(request.destination)) return true;
+  // navigate-mode with an empty destination is a download (<a download>,
+  // Content-Disposition): bytes go to disk, never into a document
+  return false;
+}
+
 async function proxyToVirtualServer(request, instanceId, serverPort, path, originalRequest) {
   // route to whichever tab owns this instanceId
   let targetPort = getPortForInstance(instanceId);
@@ -1689,9 +1981,11 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
   }
 
-  // Clone the original request before consuming the body, so we can use it
-  // for the 404 fallback fetch later if needed.
-  const fallbackRequest = originalRequest ? originalRequest.clone() : null;
+  // What the 404 fallback fetch needs of the original request. It sends no
+  // body, so no clone (a clone would tee and hold a POST body unread).
+  const fallbackRequest = originalRequest
+    ? { url: originalRequest.url, method: originalRequest.method, headers: originalRequest.headers }
+    : null;
 
   const headers = {};
   request.headers.forEach((v, k) => {
@@ -1723,6 +2017,35 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   if (merged) headers["cookie"] = merged;
   else delete headers["cookie"];
 
+  // cacheable only for plain GETs of subresources: documents get per-load
+  // script injection, and range requests want partial bodies. Credentialed
+  // requests may get per-user responses: not cached either.
+  const cacheKey =
+    method === "GET" &&
+    !headers["range"] &&
+    !headers["authorization"] &&
+    !isDocumentRequest(originalRequest || request)
+      ? responseCacheKey(instanceId, serverPort, path)
+      : null;
+  // a hard reload or a no-cache request goes to the server as asked
+  const requestCacheControl = (headers["cache-control"] || "") + " " + (headers["pragma"] || "");
+  const bypassCache =
+    request.cache === "reload" ||
+    request.cache === "no-cache" ||
+    request.cache === "no-store" ||
+    /no-cache|no-store/i.test(requestCacheControl);
+  const storeAllowed = request.cache !== "no-store" && !/no-store/i.test(requestCacheControl);
+  const cacheEpoch = responseCacheEpoch;
+  let cached = cacheKey && !bypassCache ? responseCacheGet(cacheKey) : null;
+  if (cached && !varyMatches(cached, headers)) cached = null;
+  if (cached && cached.immutable) return cachedResponse(cached);
+  let revalidating = false;
+  if (cached && cached.etag && !headers["if-none-match"]) {
+    headers["if-none-match"] = cached.etag;
+    revalidating = true;
+  }
+  const requestHeaders = Object.assign({}, headers);
+
   let body = undefined;
   if (request.method !== "GET" && request.method !== "HEAD") {
     try {
@@ -1734,8 +2057,9 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
 
   const id = nextId++;
   const promise = new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject, port: targetPort });
-    setTimeout(() => {
+    const entry = { resolve, reject, port: targetPort, timer: null };
+    pending.set(id, entry);
+    entry.timer = setTimeout(() => {
       if (pending.has(id)) {
         const entry = pending.get(id);
         pending.delete(id);
@@ -1752,23 +2076,30 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
   });
 
   try {
-    targetPort.postMessage({
-      type: "request",
-      id,
-      data: {
-        instanceId,
-        port: serverPort,
-        method: request.method,
-        url: path,
-        headers,
-        body,
-        // original url so main thread can fall back to a network fetch if
-        // the virtual server returns 404 (fonts, CDNs etc)
-        originalUrl: request.url,
+    targetPort.postMessage(
+      {
+        type: "request",
+        id,
+        data: {
+          instanceId,
+          port: serverPort,
+          method: request.method,
+          url: path,
+          headers,
+          body,
+          // original url so main thread can fall back to a network fetch if
+          // the virtual server returns 404 (fonts, CDNs etc)
+          originalUrl: request.url,
+          // answer with the body as a transferred ArrayBuffer, not base64
+          rawBody: true,
+        },
       },
-    });
+      body ? [body] : [],
+    );
   } catch (err) {
     // port got detached between lookup and post
+    const entry = pending.get(id);
+    if (entry && entry.timer) clearTimeout(entry.timer);
     pending.delete(id);
     cleanupPort(targetPort);
     return errorPage(503, "Service Unavailable", "The owning tab for this server is no longer connected.");
@@ -1778,13 +2109,47 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     const data = await promise;
     let responseBody = null;
     // HEAD responses must not include a body even if upstream sent one
-    if (method !== "HEAD" && data.bodyBase64) {
-      const binary = atob(data.bodyBase64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      responseBody = bytes;
+    if (method !== "HEAD") {
+      if (data.body instanceof ArrayBuffer) {
+        if (data.body.byteLength > 0) responseBody = new Uint8Array(data.body);
+      } else if (data.bodyBase64) {
+        // a tab running an older nodepod still answers in base64
+        const binary = atob(data.bodyBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        responseBody = bytes;
+      }
     }
+    // our own If-None-Match matched: the cached copy is current. A 304 still
+    // carries headers of its own (cookies, a refreshed validator)
+    if (revalidating && data.statusCode === 304) {
+      const notModified = data.headers || {};
+      for (const k of Object.keys(notModified)) {
+        if (k.toLowerCase() === "set-cookie") storeSetCookies(instanceId, serverPort, notModified[k]);
+      }
+      const refreshed = headerValue(notModified, "etag");
+      if (refreshed) cached.etag = refreshed;
+      return cachedResponse(cached);
+    }
+
     const respHeaders = Object.assign({}, data.headers || {});
+    const cacheControl = headerValue(respHeaders, "cache-control").toLowerCase();
+    const etag = headerValue(respHeaders, "etag");
+    const vary = headerValue(respHeaders, "vary").toLowerCase();
+    const varyNames = vary ? vary.split(",").map((s) => s.trim()).filter(Boolean) : null;
+    const cacheable =
+      cacheKey &&
+      storeAllowed &&
+      !data.fromNetwork &&
+      cacheEpoch === responseCacheEpoch &&
+      data.statusCode === 200 &&
+      !headerValue(respHeaders, "set-cookie") &&
+      !/no-store|private/.test(cacheControl) &&
+      !(varyNames && varyNames.includes("*")) &&
+      (/\bimmutable\b/.test(cacheControl) || !!etag);
+    // a 304 answering the app's own If-None-Match says nothing against
+    // what's stored
+    if (cacheKey && !cacheable && data.statusCode !== 304) responseCacheDelete(cacheKey);
 
     // Capture Set-Cookie into the SW jar before doing anything else, so the
     // cookies survive even though the browser will ignore them on the
@@ -1809,9 +2174,14 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     // Inject WebSocket shim + preview script into HTML responses so that
     // browser-side WebSocket connections are routed through nodepod, and
     // user-provided preview scripts run before any page content.
+    //
+    // Only documents get the injection. An app's fetch()/XHR that lands on
+    // the SPA fallback (an unregistered API route returning index.html)
+    // must see the server's bytes unchanged; otherwise every such error
+    // surfaces as kilobytes of shim instead of the HTML the route returned.
     let finalBody = responseBody;
     const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
-    if (ct.includes("text/html") && responseBody) {
+    if (ct.includes("text/html") && responseBody && isDocumentRequest(originalRequest || request)) {
       // location patch runs first so user scripts see the stripped URL
       let injection =
         getNavTimingPatchScript(responseBody.byteLength) +
@@ -1885,6 +2255,22 @@ async function proxyToVirtualServer(request, instanceId, serverPort, path, origi
     }
 
     sanitizeProxyHeaders(respHeaders, instanceId, serverPort);
+
+    if (cacheable) {
+      responseCachePut(cacheKey, {
+        // a Blob: every hit answers with it without copying the bytes again
+        // (a Response over an array copies it), and they live outside the heap
+        body: finalBody ? new Blob([finalBody]) : finalBody,
+        size: (finalBody ? finalBody.byteLength : 0) + 512,
+        status: data.statusCode,
+        statusText: data.statusMessage || "OK",
+        headers: Object.assign({}, respHeaders),
+        etag,
+        immutable: /\bimmutable\b/.test(cacheControl),
+        varyNames,
+        varyValues: varyNames ? varyValues(varyNames, requestHeaders) : null,
+      });
+    }
 
     return buildProxyResponse(
       finalBody,

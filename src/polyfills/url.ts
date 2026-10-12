@@ -1,4 +1,5 @@
 // URL module with legacy parse/format/resolve and fileURLToPath/pathToFileURL
+import { parse as parseQueryString, stringify as stringifyQuery } from "./querystring";
 
 export interface Url {
   protocol?: string | null;
@@ -34,11 +35,11 @@ function parsePathOnly(raw: string, parseQuery: boolean): Url {
     search = pathname.substring(searchPos);
     pathname = pathname.substring(0, searchPos);
   }
-  let query: string | Record<string, string | string[]> | null = null;
+  let query: string | Record<string, string | string[]> | null = parseQuery ? parseQueryString("") : null;
   if (search) {
     const qs = search.substring(1);
     if (parseQuery) {
-      query = Object.fromEntries(new globalThis.URLSearchParams(qs));
+      query = parseQueryString(qs);
     } else {
       query = qs;
     }
@@ -77,14 +78,14 @@ export function parse(
         : u.username
       : null;
     const queryVal = parseQuery
-      ? Object.fromEntries(u.searchParams)
+      ? parseQueryString(u.search.substring(1))
       : u.search
         ? u.search.substring(1)
         : null;
 
     return {
       protocol: u.protocol,
-      slashes: u.protocol.endsWith(":"),
+      slashes: raw.slice(raw.indexOf(":") + 1).startsWith("//") || null,
       auth: authPart,
       host: u.host,
       port: u.port || null,
@@ -102,8 +103,6 @@ export function parse(
 }
 
 export function format(obj: Url): string {
-  if (obj.href) return obj.href;
-
   let result = "";
 
   if (obj.protocol) {
@@ -131,15 +130,7 @@ export function format(obj: Url): string {
     if (typeof obj.query === "string") {
       result += "?" + obj.query;
     } else {
-      const params = new globalThis.URLSearchParams();
-      for (const [key, val] of Object.entries(obj.query)) {
-        if (Array.isArray(val)) {
-          for (const item of val) params.append(key, item);
-        } else {
-          params.set(key, val);
-        }
-      }
-      const qs = params.toString();
+      const qs = stringifyQuery(obj.query);
       if (qs) result += "?" + qs;
     }
   }
@@ -157,8 +148,21 @@ export function resolve(base: string, target: string): string {
   }
 }
 
-// Re-export the native browser URL and URLSearchParams
-export const URL = globalThis.URL;
+// Chromium reads a file: URL without `//` (`"file:" + __filename`, as zx's
+// cli builds its own URL) as naming a host: file:/home/a -> file://home/a.
+// node, per WHATWG, keeps it all path: file:///home/a.
+export function toNodeFileUrl<T>(input: T): T | string {
+  if (typeof input !== "string") return input;
+  const m = /^file:(?!\/\/)\/?/i.exec(input);
+  return m ? "file:///" + input.slice(m[0].length) : input;
+}
+
+// The native browser URL, parsing file: URLs like node, and URLSearchParams
+export class URL extends globalThis.URL {
+  constructor(url: string | globalThis.URL, base?: string | globalThis.URL) {
+    super(toNodeFileUrl(url), toNodeFileUrl(base));
+  }
+}
 export const URLSearchParams = globalThis.URLSearchParams;
 
 function throwInvalidUrlScheme(protocol: string): never {
@@ -174,7 +178,7 @@ export function fileURLToPath(input: string | URL): string {
     // Bare filesystem path — return as-is
     if (input.startsWith("/") && !hasScheme(input)) return input;
     try {
-      const urlObj = new globalThis.URL(input);
+      const urlObj = new URL(input);
       if (urlObj.protocol !== "file:") {
         throwInvalidUrlScheme(urlObj.protocol);
       }

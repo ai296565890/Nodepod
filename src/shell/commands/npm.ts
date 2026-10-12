@@ -1,6 +1,7 @@
 import type { ShellCommand } from "../shell-types";
-import type { PmDeps } from "./pm-types";
+import { splitLeadingSilentFlags, type PmDeps } from "./pm-types";
 import { VERSIONS } from "../../constants/config";
+import { GLOBAL_BIN, GLOBAL_LIB, GLOBAL_PREFIX, hasGlobalFlag } from "../../packages/pm-cli";
 
 const A_RESET = "\x1b[0m";
 const A_BOLD = "\x1b[1m";
@@ -9,7 +10,8 @@ const A_CYAN = "\x1b[36m";
 export function createNpmCommand(deps: PmDeps): ShellCommand {
   return {
     name: "npm",
-    async execute(params, ctx) {
+    async execute(rawParams, ctx) {
+      const { silent, params } = splitLeadingSilentFlags(rawParams);
       if (!deps.hasFile("/"))
         return { stdout: "", stderr: "Volume unavailable\n", exitCode: 1 };
 
@@ -42,18 +44,16 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
       switch (sub) {
         case "run":
         case "run-script":
-          return deps.runScript(params.slice(1), ctx);
+          return deps.runScript([...silent, ...params.slice(1)], ctx);
         case "start":
-          return deps.runScript(["start"], ctx);
+          return deps.runScript([...silent, "start"], ctx);
         case "test":
         case "t":
         case "tst":
-          return deps.runScript(["test"], ctx);
+          return deps.runScript([...silent, "test"], ctx);
         case "install":
         case "i":
         case "add": {
-          const rejected = deps.rejectGlobal(params.slice(1), "npm");
-          if (rejected) return rejected;
           return deps.installPackages(params.slice(1), ctx);
         }
         case "ci":
@@ -65,7 +65,7 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
           return deps.uninstallPackages(params.slice(1), ctx);
         case "ls":
         case "list":
-          return deps.listPackages(ctx);
+          return deps.listPackages(ctx, "npm", params.slice(1));
         case "init":
         case "create":
           return deps.npmInitOrCreate(params.slice(1), sub, ctx);
@@ -80,16 +80,20 @@ export function createNpmCommand(deps: PmDeps): ShellCommand {
         case "exec":
           return deps.npxExecute(params.slice(1), ctx);
         case "prefix":
-          return { stdout: ctx.cwd + "\n", stderr: "", exitCode: 0 };
+          return {
+            stdout: (hasGlobalFlag(params) ? GLOBAL_PREFIX : ctx.cwd) + "\n",
+            stderr: "",
+            exitCode: 0,
+          };
         case "root":
           return {
-            stdout: ctx.cwd + "/node_modules\n",
+            stdout: (hasGlobalFlag(params) ? GLOBAL_LIB : ctx.cwd) + "/node_modules\n",
             stderr: "",
             exitCode: 0,
           };
         case "bin":
           return {
-            stdout: ctx.cwd + "/node_modules/.bin\n",
+            stdout: (hasGlobalFlag(params) ? GLOBAL_BIN : ctx.cwd + "/node_modules/.bin") + "\n",
             stderr: "",
             exitCode: 0,
           };

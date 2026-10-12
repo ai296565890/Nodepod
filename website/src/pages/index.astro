@@ -34,7 +34,7 @@ const primitives = [
 
     <div class="install-command" data-copy-block>
       <span aria-hidden="true">$</span>
-      <code>npm install @scelar/nodepod</code>
+      <code>npm install @r1ck404/nodepod</code>
       <button type="button" data-copy-command aria-label="Copy install command">Copy</button>
     </div>
   </section>
@@ -115,7 +115,7 @@ const primitives = [
     <div class="closing-item">
       <div class="section-kicker">06 / Sustain the work</div>
       <h2>Help move Node.js<br />into the browser.</h2>
-      <p>Sponsorship will support compatibility work, documentation, and the long tail of Node APIs.</p>
+      <p>Sponsorship supports compatibility work, documentation, and the long tail of Node APIs.</p>
       <a class="text-link" href={`${base}/sponsors/`}>Sponsorship details <span aria-hidden="true">→</span></a>
     </div>
   </section>
@@ -124,7 +124,7 @@ const primitives = [
 <script>
   const button = document.querySelector<HTMLButtonElement>("[data-copy-command]");
   button?.addEventListener("click", async () => {
-    const command = "npm install @scelar/nodepod";
+    const command = "npm install @r1ck404/nodepod";
     await navigator.clipboard.writeText(command);
     button.textContent = "Copied";
     window.setTimeout(() => { button.textContent = "Copy"; }, 1600);

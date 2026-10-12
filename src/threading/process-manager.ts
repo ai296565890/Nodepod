@@ -6,17 +6,23 @@ import type { MemoryVolume } from "../memory-volume";
 import { CDN_WA_SQLITE_WASM } from "../constants/cdn-urls";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
 import { precompileWasm } from "../helpers/wasm-cache";
+import {
+  getSharedEsbuildModule,
+  prefetchSharedEsbuildModule,
+} from "../helpers/esbuild-wasm-module";
 import { WASM_CACHE_PATH, WASM_SAB_HEADER_BYTES, WASM_SAB_MAX_BYTES } from "../polyfills/sqlite";
 import { ProcessHandle } from "./process-handle";
 import { buildFileSystemBridge } from "../polyfills/fs";
 import { handleFsProxy } from "../helpers/napi-wasm-worker";
-import { isRecoverableWasmPath, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
+import { getSharedTransformStore, type TransformEntry } from "./transform-store";
+import { isRecoverableWasmPath, isWasmResolverProbe, prefetchWasmFromCdn } from "../helpers/wasm-cdn";
 import type {
   SpawnConfig,
   ProcessInfo,
   MainToWorker_Init,
   VFSBinarySnapshot,
   WorkerToMain_SpawnRequest,
+  WorkerToMain_VFSMeta,
   WorkerToMain_ForkRequest,
   WorkerToMain_WorkerThreadRequest,
   WorkerToMain_WasiWorkerRequest,
@@ -25,14 +31,30 @@ import type {
   WorkerToMain_HttpResponse,
   WorkerToMain_HttpClientRequest,
   WorkerToMain_SqlitePreload,
+  WorkerToMain_PackSave,
 } from "./worker-protocol";
 import type { ShellOptions } from "../shell/shell-options";
 import type { VFSBridge } from "./vfs-bridge";
 import { getRuntimeHost } from "../host/runtime-host";
+import { getFetchPolicy } from "../cross-origin";
 import type { HostWorker } from "../host/types";
-import { SLOT_SIZE, decodeSyncSlot } from "./sync-channel";
+import { SyncResultWriter, SYNC_STATUS_ERROR } from "./sync-channel";
 import type { PerformanceTracker } from "../performance-tracker";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
+
+// A child's environment as node builds it: entries whose value is undefined
+// are dropped and the rest become strings. process.env here is a plain
+// object, so `process.env.X = undefined` (next dev does this) leaves an
+// undefined value that a child's shell can't handle.
+function childEnv(env: Record<string, unknown> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!env) return out;
+  for (const key of Object.keys(env)) {
+    const value = env[key];
+    if (value !== undefined) out[key] = String(value);
+  }
+  return out;
+}
 
 const MAX_PROCESS_DEPTH = 10;
 const MAX_PROCESSES = 50;
@@ -65,6 +87,15 @@ interface WasiBrokerRoot extends WasiBrokerChild {
   children: Map<number, WasiBrokerChild>;
 }
 
+// fs proxy calls that read file content (the rest only need metadata)
+// commands that start JavaScript tooling (directly, or via a shell's -c)
+const JS_TOOL_COMMAND_RE = /(?:^|[\s/;&|(])(?:node|npx|npm|pnpm|pnpx|yarn|bun|bunx|tsx|vite|vitest)(?:$|[\s;&|)])/;
+function runsJsTool(command: string, args?: string[]): boolean {
+  return JS_TOOL_COMMAND_RE.test(command) || (!!args && args.length > 0 && JS_TOOL_COMMAND_RE.test(args.join(" ")));
+}
+
+const PAGE_IN_FS_OPS = new Set(["readFileSync", "readFile", "openSync", "copyFileSync", "openAsBlob"]);
+
 export class ProcessManager extends EventEmitter {
   private _processes = new Map<number, ProcessHandle>();
   private _nextPid = 100;
@@ -84,6 +115,11 @@ export class ProcessManager extends EventEmitter {
   // pids of children that inherit their parent's stdin. stdin-forward only
   // routes to pids in this set. stdio:'pipe' kids get their own isolated stdin.
   private _inheritStdinChildren = new Set<number>();
+  // pids of children whose stdout is their parent's terminal: they start at
+  // the parent's size and get its resizes, like processes sharing a tty
+  private _ttyChildren = new Set<number>();
+  // spawnSync/execSync results bigger than one sync slot, by slot handle
+  private _syncWriters = new Map<number, { pid: number; writer: SyncResultWriter }>();
   private _httpCallbacks = new Map<
     number,
     { pid: number; fn: (resp: WorkerToMain_HttpResponse) => void }
@@ -98,6 +134,11 @@ export class ProcessManager extends EventEmitter {
   ) {
     super();
     this._volume = volume;
+    // index of persisted transform packs, ready before the first spawn needs it
+    void getSharedTransformStore().loadIndex();
+    // bulk mounts (package cache restores) fire no watchers: running
+    // processes that already listed those directories must list them again
+    volume.onSilentMount((paths) => this._relistInWorkers(paths));
     this._performance = performanceTracker;
     this._profiler = profiler;
   }
@@ -108,6 +149,14 @@ export class ProcessManager extends EventEmitter {
 
   setSyncBuffer(buf: SharedArrayBuffer): void {
     this._syncBuffer = buf;
+  }
+
+  // saves an install's package pack from this thread's volume (the owner
+  // of the snapshot cache sets it); processes then leave that to it
+  private _packSaver: ((key: string) => void) | null = null;
+
+  setPackSaver(saver: ((key: string) => void) | null): void {
+    this._packSaver = saver;
   }
 
   // "lean" spawns exclude node_modules etc. from snapshots; workers hydrate
@@ -152,6 +201,13 @@ export class ProcessManager extends EventEmitter {
 
     const pid = this._nextPid++;
 
+    // a JS tool starting where esbuild is installed: start compiling the
+    // shared wasm module now so it is ready by the time the new process
+    // first calls into esbuild
+    if (runsJsTool(config.command, config.args) && this._hasInstalledEsbuild(config.cwd ?? "/")) {
+      prefetchSharedEsbuildModule();
+    }
+
     // lean mode needs SAB in the worker (Atomics.wait for the lazy fs proxy)
     let lean = this._spawnSnapshotMode === "lean";
     if (lean && (typeof SharedArrayBuffer === "undefined" || !this._syncBuffer)) {
@@ -181,7 +237,7 @@ export class ProcessManager extends EventEmitter {
       command: config.command,
       args: config.args ?? [],
       cwd: config.cwd ?? "/",
-      env: config.env ?? {},
+      env: childEnv(config.env),
       shell: config.shell,
       snapshot,
       syncBuffer: this._syncBuffer ?? undefined,
@@ -236,8 +292,16 @@ export class ProcessManager extends EventEmitter {
       const lazyCh = new MessageChannel();
       lazyCh.port1.onmessage = (e: MessageEvent) => {
         const data = e.data;
-        if (!data || typeof data !== "object" || !data.__fs__) return;
-        this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
+        if (!data || typeof data !== "object") return;
+        if (data.__fs__) {
+          this._handleFsProxyWithRecovery(data.__fs__, lazyBridge);
+        } else if (data.__tc__) {
+          void this._answerTransformPack(data.__tc__);
+        } else if (data.__tcput__) {
+          const put = data.__tcput__ as { scope: string; text?: string; entries?: TransformEntry[] };
+          const batch = put.text ?? put.entries;
+          if (batch) getSharedTransformStore().put(put.scope, batch);
+        }
       };
       lazyCh.port1.start();
       ownedPorts.push(lazyCh.port1);
@@ -256,7 +320,17 @@ export class ProcessManager extends EventEmitter {
       lazyFsPort,
       sqliteStartup: this._isDependencyManagementCommand(config.command, config.args ?? [])
         ? "bytes"
-        : "engine",
+        : "lazy",
+      // null: the index isn't read yet, so the worker asks for every pack
+      transformScopes: lazyFsPort
+        ? getSharedTransformStore().indexLoaded
+          ? getSharedTransformStore().knownScopes()
+          : null
+        : undefined,
+      // paged-out package content would have to be read back first: the
+      // process saves its packs itself then
+      deferPackSave: !!this._packSaver && !this._volume.evictionEnabled,
+      fetchPolicy: getFetchPolicy(),
     };
     this._processPorts.set(pid, ownedPorts);
     try {
@@ -270,6 +344,21 @@ export class ProcessManager extends EventEmitter {
 
     this.emit("spawn", pid, config.command, config.args);
     return handle;
+  }
+
+  private _hasInstalledEsbuild(cwd: string): boolean {
+    let dir = cwd.replace(/\/+$/, "") || "/";
+    for (let depth = 0; depth < 8; depth++) {
+      const base = dir === "/" ? "" : dir;
+      try {
+        if (this._volume.existsSync(`${base}/node_modules/esbuild/package.json`)) return true;
+      } catch {
+        /* ignore */
+      }
+      if (dir === "/") break;
+      dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+    }
+    return false;
   }
 
   private _isDependencyManagementCommand(command: string, args: string[]): boolean {
@@ -371,6 +460,7 @@ export class ProcessManager extends EventEmitter {
     this._serverPorts.clear();
     this._childPids.clear();
     this._inheritStdinChildren.clear();
+    this._ttyChildren.clear();
     for (const [requestId, entry] of this._httpCallbacks) {
       entry.fn({
         type: "http-response",
@@ -393,6 +483,7 @@ export class ProcessManager extends EventEmitter {
       this._processPorts.delete(pid);
     }
     this._inheritStdinChildren.delete(pid);
+    this._ttyChildren.delete(pid);
     this._childPids.delete(pid);
     for (const children of this._childPids.values()) children.delete(pid);
     for (const [key, owned] of this._wasiWorkers) {
@@ -464,7 +555,7 @@ export class ProcessManager extends EventEmitter {
     method: string,
     path: string,
     headers: Record<string, string>,
-    body?: string | null,
+    body?: string | ArrayBuffer | null,
   ): Promise<{ statusCode: number; statusMessage: string; headers: Record<string, string | string[]>; body: string | ArrayBuffer }> {
     const pid = this._serverPorts.get(port);
     if (pid === undefined) {
@@ -513,15 +604,18 @@ export class ProcessManager extends EventEmitter {
         },
       });
 
-      handle.postMessage({
-        type: "http-request",
-        requestId,
-        port,
-        method,
-        path,
-        headers,
-        body: body ?? null,
-      });
+      handle.postMessage(
+        {
+          type: "http-request",
+          requestId,
+          port,
+          method,
+          path,
+          headers,
+          body: body ?? null,
+        },
+        body instanceof ArrayBuffer ? [body] : undefined,
+      );
     });
   }
 
@@ -529,6 +623,21 @@ export class ProcessManager extends EventEmitter {
     clientHandle: ProcessHandle,
     msg: WorkerToMain_HttpClientRequest,
   ): void {
+    const ownerPid = this._serverPorts.get(msg.port);
+    const owner = ownerPid === undefined ? undefined : this._processes.get(ownerPid);
+    if (!owner || owner.state === "exited") {
+      if (ownerPid !== undefined) this._serverPorts.delete(msg.port);
+      clientHandle.postMessage({
+        type: "http-client-response",
+        requestId: msg.requestId,
+        statusCode: 0,
+        statusMessage: "",
+        headers: {},
+        body: "",
+        connectionRefused: true,
+      });
+      return;
+    }
     this.dispatchHttpRequest(
       msg.port,
       msg.method,
@@ -641,14 +750,45 @@ export class ProcessManager extends EventEmitter {
     return { worker, url: worker.__nodepodRevokeUrl ?? "" };
   }
 
+  // A worker is blocked (Atomics.wait) until the pack is written into its SAB;
+  // reading a pack that isn't in memory yet goes to IndexedDB first.
+  private async _answerTransformPack(
+    request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
+  ): Promise<void> {
+    let text = "[]";
+    try {
+      text = await getSharedTransformStore().packText(String(request.payload?.[0] ?? ""));
+    } catch {
+      /* answer with an empty pack */
+    }
+    handleFsProxy(request, { transformPack: () => text });
+  }
+
   private _handleFsProxyWithRecovery(
     request: { sab: Int32Array; type: string; payload: any[]; requestId?: number },
     bridge: ReturnType<typeof buildFileSystemBridge>,
+    pagedIn = false,
   ): void {
     const path = request.payload?.[0];
+    // paged-out package content: read it back in, then answer. the worker
+    // is blocked on Atomics.wait meanwhile; handleFsProxy re-checks the
+    // request sequence, so a reply after the worker gave up is dropped
+    if (
+      !pagedIn &&
+      typeof path === "string" &&
+      PAGE_IN_FS_OPS.has(request.type) &&
+      this._volume.isPagedOut(path)
+    ) {
+      void this._volume
+        .ensureResident(path)
+        .catch((e) => console.warn(`[ProcessManager] paging in "${path}" failed:`, e))
+        .then(() => this._handleFsProxyWithRecovery(request, bridge, true));
+      return;
+    }
     const canRecover = (request.type === "statSync" || request.type === "readFileSync")
       && isRecoverableWasmPath(path)
-      && !this._volume.existsSync(path);
+      && !this._volume.existsSync(path)
+      && !isWasmResolverProbe(this._volume, path);
     if (!canRecover) {
       handleFsProxy(request, bridge);
       return;
@@ -754,6 +894,14 @@ export class ProcessManager extends EventEmitter {
     };
   }
 
+  // called before the child is told to run, so its first read of
+  // process.stdout.columns is the real terminal width
+  private _shareTerminal(parent: ProcessHandle, child: ProcessHandle): void {
+    this._ttyChildren.add(child.pid);
+    const size = parent.terminalSize;
+    if (size) child.resize(size.cols, size.rows);
+  }
+
   private _createWorker(): HostWorker {
     return getRuntimeHost().createWorker({ type: "process" });
   }
@@ -779,6 +927,18 @@ export class ProcessManager extends EventEmitter {
           if (childHandle && childHandle.state !== "exited") {
             childHandle.sendStdin(data);
           }
+        }
+      }
+    });
+
+    handle.on("resize", (cols: number, rows: number) => {
+      const children = this._childPids.get(handle.pid);
+      if (!children) return;
+      for (const childPid of children) {
+        if (!this._ttyChildren.has(childPid)) continue;
+        const childHandle = this._processes.get(childPid);
+        if (childHandle && childHandle.state !== "exited") {
+          childHandle.resize(cols, rows);
         }
       }
     });
@@ -832,6 +992,12 @@ export class ProcessManager extends EventEmitter {
       }
     });
 
+    handle.on("vfs-meta", (meta: WorkerToMain_VFSMeta) => {
+      if (this._vfsBridge && !isInternalVfsPath(meta.path)) {
+        this._vfsBridge.handleWorkerMeta(meta);
+      }
+    });
+
     handle.on("vfs-snapshot", (snapshot: VFSBinarySnapshot) => {
       if (!this._vfsBridge) return;
       this._vfsBridge.handleWorkerSnapshot(snapshot);
@@ -861,7 +1027,7 @@ export class ProcessManager extends EventEmitter {
           command: msg.command,
           args: msg.args,
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           shell: msg.shell,
           parentPid: handle.pid,
         });
@@ -876,6 +1042,9 @@ export class ProcessManager extends EventEmitter {
         const inheritsStdin = msg.stdio === "inherit"
           || (Array.isArray(msg.stdio) && msg.stdio[0] === "inherit");
         if (inheritsStdin) this._inheritStdinChildren.add(childHandle.pid);
+        if (msg.stdio === "inherit" || (Array.isArray(msg.stdio) && msg.stdio[1] === "inherit")) {
+          this._shareTerminal(handle, childHandle);
+        }
 
         // defer parent exit/done until child finishes (e.g. create-vite -> vite dev)
         handle.holdExit();
@@ -895,6 +1064,10 @@ export class ProcessManager extends EventEmitter {
         const isDirectNodeFile = isNodeBin
           && msg.args.length > 0
           && !msg.args[0].startsWith("-");
+        // stdout read by the parent (the default) is a pipe; an inherited one
+        // is whatever the parent's is
+        const stdoutMode = Array.isArray(msg.stdio) ? msg.stdio[1] : msg.stdio;
+        const stdoutIsTTY = stdoutMode === "inherit" && handle.stdoutIsTTY;
         const sendExec = () => {
           if (isDirectNodeFile) {
             childHandle.exec({
@@ -902,8 +1075,9 @@ export class ProcessManager extends EventEmitter {
               filePath: msg.args[0],
               args: msg.args.slice(1),
               cwd: msg.cwd,
-              env: msg.env,
+              env: childEnv(msg.env),
               isShell: false,
+              stdoutIsTTY,
             });
           } else {
             childHandle.exec({
@@ -911,9 +1085,10 @@ export class ProcessManager extends EventEmitter {
               filePath: "",
               args: msg.args,
               cwd: msg.cwd,
-              env: msg.env,
+              env: childEnv(msg.env),
               isShell: true,
               shellCommand: fullCmd,
+              stdoutIsTTY,
             });
           }
         };
@@ -986,6 +1161,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1001,11 +1177,12 @@ export class ProcessManager extends EventEmitter {
 
     handle.on("fork-request", (msg: WorkerToMain_ForkRequest) => {
       try {
+        let ipcDisconnected = handle.workerExited;
         const childHandle = this.spawn({
           command: "node",
           args: [msg.modulePath, ...msg.args],
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1028,10 +1205,16 @@ export class ProcessManager extends EventEmitter {
             filePath: msg.modulePath,
             args: msg.args,
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: false,
             isFork: true,
+            serialization: msg.serialization,
+            execArgv: msg.execArgv,
           });
+          // Keep EOF after exec, including a child still probing/initializing
+          // when its owner finishes. A fallback worker cannot inherit messages
+          // sent to the worker it replaced before initialization.
+          if (ipcDisconnected || handle.workerExited) childHandle.postMessage({ type: "ipc-disconnect" });
         };
 
         if (childHandle.state === "running") {
@@ -1088,6 +1271,22 @@ export class ProcessManager extends EventEmitter {
         };
         handle.on("ipc-message", relayIpcToChild);
 
+        const disconnectChild = () => {
+          ipcDisconnected = true;
+          if (childHandle.state === "running") childHandle.postMessage({ type: "ipc-disconnect" });
+        };
+        const relayDisconnect = (message: { targetRequestId?: number }) => {
+          if (message.targetRequestId === msg.requestId) disconnectChild();
+        };
+        const notifyParentDisconnect = () => {
+          if (!handle.workerExited) handle.postMessage({ type: "ipc-disconnect", targetRequestId: msg.requestId });
+        };
+        // A native fork's IPC pipe closes when its parent exits, including
+        // unref'd worker pools. Preserve the child's own timers and other work.
+        handle.on("worker-done", disconnectChild);
+        handle.on("ipc-disconnect", relayDisconnect);
+        childHandle.on("ipc-disconnect", notifyParentDisconnect);
+
         const relayStdinToChild = (
           stdinMsg: { requestId: number; data: string; end?: boolean },
         ) => {
@@ -1106,6 +1305,9 @@ export class ProcessManager extends EventEmitter {
 
         childHandle.on("exit", (exitCode: number) => {
           handle.removeListener("ipc-message", relayIpcToChild);
+          handle.removeListener("worker-done", disconnectChild);
+          handle.removeListener("ipc-disconnect", relayDisconnect);
+          childHandle.removeListener("ipc-disconnect", notifyParentDisconnect);
           handle.removeListener("child-stdin", relayStdinToChild);
           handle.removeListener("child-signal", relayChildSignal);
           if (!handle.workerExited) {
@@ -1123,6 +1325,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1156,7 +1359,7 @@ export class ProcessManager extends EventEmitter {
           command: "node",
           args: [modulePath],
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1179,7 +1382,7 @@ export class ProcessManager extends EventEmitter {
             filePath: modulePath,
             args: msg.args || [],
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: false,
             isFork: true,
             isWorkerThread: true,
@@ -1239,7 +1442,16 @@ export class ProcessManager extends EventEmitter {
           }
         });
 
+        // node terminates a thread's workers when the thread exits (an
+        // unref()'d worker still listening on parentPort included). the exit
+        // of the owner is held for its children, so end the worker here.
+        const endWithOwner = () => {
+          if (childHandle.state !== "exited") this._killWithFallback(childHandle, "SIGTERM");
+        };
+        handle.on("worker-done", endWithOwner);
+
         childHandle.on("exit", (exitCode: number) => {
+          handle.removeListener("worker-done", endWithOwner);
           if (msg.isEval) {
             try {
               this._volume.unlinkSync(`/__wt_eval_${msg.threadId}__.js`);
@@ -1263,6 +1475,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseExit();
           handle.releaseShellDone();
         });
@@ -1373,11 +1586,41 @@ export class ProcessManager extends EventEmitter {
       this._finishWasiWorker(handle, msg.requestId, 1);
     });
 
+    handle.on("esbuild-module-request", () => {
+      void getSharedEsbuildModule().then((module) => {
+        if (handle.state === "exited") return;
+        try {
+          handle.postMessage({ type: "esbuild-module", module });
+        } catch {
+          handle.postMessage({ type: "esbuild-module", module: null });
+        }
+      });
+    });
+
+    handle.on("pack-save", (msg: WorkerToMain_PackSave) => {
+      this._packSaver?.(msg.key);
+    });
+
     handle.on("sqlite-preload", (msg: WorkerToMain_SqlitePreload) => {
+      // no buffer: cache the bytes for later processes, nobody is waiting
+      if (!msg.sab) {
+        if (!this._volume.existsSync(WASM_CACHE_PATH)) void this._cacheSqliteWasm().catch(() => {});
+        return;
+      }
       handle.holdSync();
       void this._handleSqlitePreload(handle, msg.sab).finally(() => {
         handle.releaseSync();
       });
+    });
+
+    handle.on("sync-more", (syncSlot: number) => {
+      const pending = this._syncWriters.get(syncSlot);
+      if (pending && !pending.writer.writeNext()) this._syncWriters.delete(syncSlot);
+    });
+    handle.on("exit", () => {
+      for (const [syncSlot, pending] of this._syncWriters) {
+        if (pending.pid === handle.pid) this._syncWriters.delete(syncSlot);
+      }
     });
 
     handle.on("spawn-sync", (msg: WorkerToMain_SpawnSync) => {
@@ -1395,17 +1638,9 @@ export class ProcessManager extends EventEmitter {
         (msg.args.length
           ? `${quoteShell(msg.command)} ${msg.args.map(quoteShell).join(" ")}`
           : quoteShell(msg.command));
-      const maxStdoutLen = (SLOT_SIZE - 3) * 4;
-      const { slot: syncSlotIndex } = decodeSyncSlot(msg.syncSlot);
-
       const signalError = (exitCode: number) => {
         try {
-          const int32 = new Int32Array(this._syncBuffer!);
-          const slotBase = syncSlotIndex * SLOT_SIZE;
-          Atomics.store(int32, slotBase + 1, exitCode);
-          Atomics.store(int32, slotBase + 2, 0);
-          Atomics.store(int32, slotBase, 2); // STATUS_ERROR
-          Atomics.notify(int32, slotBase);
+          new SyncResultWriter(this._syncBuffer!, msg.syncSlot, exitCode, "", "", SYNC_STATUS_ERROR).writeNext();
         } catch {
           // buffer unusable, worker will time out
         }
@@ -1416,7 +1651,7 @@ export class ProcessManager extends EventEmitter {
           command: msg.command,
           args: msg.args,
           cwd: msg.cwd,
-          env: msg.env,
+          env: childEnv(msg.env),
           parentPid: handle.pid,
         });
 
@@ -1431,6 +1666,7 @@ export class ProcessManager extends EventEmitter {
         // under create-vite).
         const stdinInherits = !msg.stdio || msg.stdio[0] === "inherit";
         if (stdinInherits) this._inheritStdinChildren.add(childHandle.pid);
+        if (!msg.stdio || msg.stdio[1] === "inherit") this._shareTerminal(handle, childHandle);
 
         handle.holdExit();
         handle.holdShellDone();
@@ -1442,9 +1678,11 @@ export class ProcessManager extends EventEmitter {
             filePath: "",
             args: msg.args,
             cwd: msg.cwd,
-            env: msg.env,
+            env: childEnv(msg.env),
             isShell: true,
             shellCommand: fullCmd,
+            // captured output (execSync's default) is a pipe, not a terminal
+            stdoutIsTTY: (!msg.stdio || msg.stdio[1] === "inherit") && handle.stdoutIsTTY,
           });
         };
 
@@ -1454,13 +1692,20 @@ export class ProcessManager extends EventEmitter {
           childHandle.on("ready", sendExec);
         }
 
-        // parent is blocked on Atomics.wait, can't process postMessage — emit directly
-        childHandle.on("stdout", (data: string) => {
-          handle.emit("stdout", data);
-        });
-        childHandle.on("stderr", (data: string) => {
-          handle.emit("stderr", data);
-        });
+        // parent is blocked on Atomics.wait, can't process postMessage — emit
+        // directly. only streams the child shares with the parent show up in
+        // its output; piped ones are captured for the result (node: execSync
+        // captures stdout and passes stderr through, spawnSync captures both)
+        if (!msg.stdio || msg.stdio[1] === "inherit") {
+          childHandle.on("stdout", (data: string) => {
+            handle.emit("stdout", data);
+          });
+        }
+        if (!msg.stdio || msg.stdio[2] === "inherit") {
+          childHandle.on("stderr", (data: string) => {
+            handle.emit("stderr", data);
+          });
+        }
 
         childHandle.on("stdin-raw-status", (isRaw: boolean) => {
           handle.emit("stdin-raw-status", isRaw);
@@ -1468,22 +1713,16 @@ export class ProcessManager extends EventEmitter {
 
         childHandle.on("exit", (exitCode: number) => {
           try {
-            const int32 = new Int32Array(this._syncBuffer!);
-            const encoder = new TextEncoder();
-            const slotBase = syncSlotIndex * SLOT_SIZE;
-            const stdoutBytes = encoder.encode(childHandle.stdout);
-            const truncatedLen = Math.min(stdoutBytes.byteLength, maxStdoutLen);
-
-            Atomics.store(int32, slotBase + 1, exitCode);
-            Atomics.store(int32, slotBase + 2, truncatedLen);
-
-            const uint8 = new Uint8Array(this._syncBuffer!);
-            const dataOffset = (slotBase + 3) * 4;
-            uint8.set(stdoutBytes.subarray(0, truncatedLen), dataOffset);
-
-            // last store wakes the waiting worker
-            Atomics.store(int32, slotBase, 1);
-            Atomics.notify(int32, slotBase);
+            // stdout and stderr, in as many chunks as they need: the worker
+            // asks for each further one with "sync-more"
+            const writer = new SyncResultWriter(
+              this._syncBuffer!,
+              msg.syncSlot,
+              exitCode,
+              childHandle.stdout,
+              childHandle.stderr,
+            );
+            if (writer.writeNext()) this._syncWriters.set(msg.syncSlot, { pid: handle.pid, writer });
           } catch {
             signalError(1);
           }
@@ -1494,6 +1733,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
 
           handle.releaseSync();
           handle.releaseExit();
@@ -1508,6 +1748,7 @@ export class ProcessManager extends EventEmitter {
             if (children.size === 0) this._childPids.delete(handle.pid);
           }
           this._inheritStdinChildren.delete(childHandle.pid);
+          this._ttyChildren.delete(childHandle.pid);
           handle.releaseSync();
           handle.releaseExit();
           handle.releaseShellDone();
@@ -1557,6 +1798,38 @@ export class ProcessManager extends EventEmitter {
   private static readonly SAB_STATUS_OK = 1;
   private static readonly SAB_STATUS_FAIL = 2;
 
+  // wa-sqlite's wasm in the volume's cache path (fetched on first use)
+  private _sqliteWasmFetch: Promise<Uint8Array> | null = null;
+  private async _cacheSqliteWasm(): Promise<Uint8Array> {
+    if (this._volume.existsSync(WASM_CACHE_PATH)) {
+      return new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
+    }
+    this._sqliteWasmFetch ??= (async () => {
+      const resp = await fetch(CDN_WA_SQLITE_WASM);
+      if (!resp.ok) {
+        throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
+      }
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      if (this._vfsBridge) {
+        this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
+      } else {
+        const parent = WASM_CACHE_PATH.substring(
+          0,
+          WASM_CACHE_PATH.lastIndexOf("/"),
+        );
+        if (parent && !this._volume.existsSync(parent)) {
+          this._volume.mkdirSync(parent, { recursive: true });
+        }
+        this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
+      }
+      precompileWasm(bytes);
+      return bytes;
+    })().finally(() => {
+      this._sqliteWasmFetch = null;
+    });
+    return this._sqliteWasmFetch;
+  }
+
   private async _handleSqlitePreload(
     handle: ProcessHandle,
     sab: Int32Array,
@@ -1574,29 +1847,7 @@ export class ProcessManager extends EventEmitter {
         WASM_SAB_MAX_BYTES,
       );
 
-      let bytes: Uint8Array;
-      if (this._volume.existsSync(WASM_CACHE_PATH)) {
-        bytes = new Uint8Array(this._volume.readFileSync(WASM_CACHE_PATH));
-      } else {
-        const resp = await fetch(CDN_WA_SQLITE_WASM);
-        if (!resp.ok) {
-          throw new Error(`fetch wa-sqlite.wasm failed: ${resp.status}`);
-        }
-        bytes = new Uint8Array(await resp.arrayBuffer());
-        if (this._vfsBridge) {
-          this._vfsBridge.handleWorkerWrite(WASM_CACHE_PATH, bytes);
-        } else {
-          const parent = WASM_CACHE_PATH.substring(
-            0,
-            WASM_CACHE_PATH.lastIndexOf("/"),
-          );
-          if (parent && !this._volume.existsSync(parent)) {
-            this._volume.mkdirSync(parent, { recursive: true });
-          }
-          this._volume.writeFileSync(WASM_CACHE_PATH, bytes);
-        }
-        precompileWasm(bytes);
-      }
+      const bytes = await this._cacheSqliteWasm();
 
       if (bytes.byteLength > payloadView.byteLength) {
         throw new Error(
@@ -1614,6 +1865,24 @@ export class ProcessManager extends EventEmitter {
     }
   }
 
+  private _relistInWorkers(paths: string[]): void {
+    if (this._processes.size === 0) return;
+    const dirs = new Set<string>();
+    for (const path of paths) {
+      const slash = path.lastIndexOf("/");
+      dirs.add(slash <= 0 ? "/" : path.slice(0, slash));
+    }
+    const list = [...dirs];
+    for (const [, handle] of this._processes) {
+      if (handle.state === "exited") continue;
+      try {
+        handle.postMessage({ type: "vfs-relist", paths: list });
+      } catch {
+        /* exiting */
+      }
+    }
+  }
+
   private _createEmptySnapshot(): VFSBinarySnapshot {
     return {
       manifest: [],
@@ -1626,6 +1895,14 @@ export class ProcessManager extends EventEmitter {
   // TODO(plan 013/011): once lean spawns are the default, the invalidation
   // path can become the norm for all sizes (pure pull model, no byte traffic).
   private static readonly VFS_BROADCAST_MAX_BYTES = 4 * 1024 * 1024;
+
+  /** Whether any process that hasn't exited would receive a broadcast. */
+  hasLiveProcesses(): boolean {
+    for (const handle of this._processes.values()) {
+      if (handle.state !== "exited") return true;
+    }
+    return false;
+  }
 
   broadcastVFSChange(path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number): void {
     // build the outgoing payload once — postMessage without a transfer list

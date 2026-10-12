@@ -3,13 +3,14 @@
 
 import pako from "pako";
 import { MemoryVolume } from "../memory-volume";
-import { proxiedFetch } from "../cross-origin";
+import { downloadTarball } from "./registry-client";
+import { takePrefetchedTarball } from "./tarball-prefetch";
 import * as path from "../polyfills/path";
 import { offload, profiledOffload, taskId, TaskPriority } from "../threading/offload";
 import type { ExtractResult } from "../threading/offload-types";
 import { base64ToBytes } from "../helpers/byte-encoding";
 import { precompileWasm } from "../helpers/wasm-cache";
-import { getTarballCache } from "../persistence/tarball-cache";
+import { getTarballCache, shouldRefreshTarball } from "../persistence/tarball-cache";
 import { digestSync } from "../polyfills/sync-digest";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
 
@@ -65,6 +66,8 @@ export interface ExtractionOptions {
   expectedIntegrity?: string;
   /** Internal opt-in profiler hook. Omitted on the default path. */
   profiler?: NodepodProfilerImpl | null;
+  /** Sees every extracted file (path relative to the package) as it is written. */
+  onFile?: (relativePath: string, data: Uint8Array | string) => void;
 }
 
 function verifySri(bytes: ArrayBuffer, integrity: string, url: string): void {
@@ -104,20 +107,53 @@ interface ArchiveEntry {
 // Tar header helpers
 // ---------------------------------------------------------------------------
 
+let headerDecoder: TextDecoder | null = null;
+
+// A header field up to its first NUL. Fields are read for every entry of
+// every package, so plain ASCII (nearly all of them) skips the decoder.
 function readNullTerminated(
   buf: Uint8Array,
   start: number,
   len: number,
 ): string {
-  const slice = buf.slice(start, start + len);
-  const zeroPos = slice.indexOf(0);
-  const trimmed = zeroPos >= 0 ? slice.slice(0, zeroPos) : slice;
-  return new TextDecoder().decode(trimmed);
+  const limit = Math.min(start + len, buf.length);
+  let end = start;
+  let ascii = true;
+  while (end < limit) {
+    const b = buf[end];
+    if (b === 0) break;
+    if (b >= 0x80) ascii = false;
+    end++;
+  }
+  if (end === start) return "";
+  if (ascii) return String.fromCharCode.apply(null, buf.subarray(start, end) as unknown as number[]);
+  return (headerDecoder ??= new TextDecoder()).decode(buf.slice(start, end));
 }
 
+// parseInt(field.trim(), 8) || 0, without building the string
 function readOctalField(buf: Uint8Array, start: number, len: number): number {
-  const raw = readNullTerminated(buf, start, len).trim();
-  return parseInt(raw, 8) || 0;
+  const limit = Math.min(start + len, buf.length);
+  let i = start;
+  // leading whitespace (what trim() and parseInt skip)
+  while (i < limit && (buf[i] === 0x20 || (buf[i] >= 0x09 && buf[i] <= 0x0d))) i++;
+  let sign = 1;
+  if (i < limit && (buf[i] === 0x2b || buf[i] === 0x2d)) {
+    if (buf[i] === 0x2d) sign = -1;
+    i++;
+  }
+  let value = 0;
+  let digits = 0;
+  while (i < limit && buf[i] >= 0x30 && buf[i] <= 0x37) {
+    value = value * 8 + (buf[i] - 0x30);
+    digits++;
+    i++;
+  }
+  return digits > 0 ? sign * value || 0 : 0;
+}
+
+function isZeroBlock(buf: Uint8Array, start: number, len: number): boolean {
+  for (let i = start; i < start + len; i++) if (buf[i] !== 0) return false;
+  return true;
 }
 
 function classifyTypeFlag(flag: string): EntryKind {
@@ -145,21 +181,20 @@ export function* parseTarArchive(raw: Uint8Array): Generator<ArchiveEntry> {
   let cursor = 0;
 
   while (cursor + BLOCK <= raw.length) {
-    const headerBlock = raw.slice(cursor, cursor + BLOCK);
+    const header = cursor;
     cursor += BLOCK;
 
     // two zero blocks = end of archive
-    const allZero = headerBlock.every((b) => b === 0);
-    if (allZero) break;
+    if (isZeroBlock(raw, header, BLOCK)) break;
 
-    const nameField = readNullTerminated(headerBlock, 0, 100);
+    const nameField = readNullTerminated(raw, header, 100);
     if (!nameField) continue;
 
-    const fileMode = readOctalField(headerBlock, 100, 8);
-    const byteSize = readOctalField(headerBlock, 124, 12);
-    const typeChar = String.fromCharCode(headerBlock[156]);
-    const linkField = readNullTerminated(headerBlock, 157, 100);
-    const prefixField = readNullTerminated(headerBlock, 345, 155);
+    const fileMode = readOctalField(raw, header + 100, 8);
+    const byteSize = readOctalField(raw, header + 124, 12);
+    const typeChar = String.fromCharCode(raw[header + 156]);
+    const linkField = readNullTerminated(raw, header + 157, 100);
+    const prefixField = readNullTerminated(raw, header + 345, 155);
 
     const filepath = prefixField ? `${prefixField}/${nameField}` : nameField;
     const kind = classifyTypeFlag(typeChar);
@@ -283,19 +318,18 @@ async function downloadAndExtractInternal(
   // inflation stays serialized under the memory budget
   let cachedBytes: ArrayBuffer | null = null;
   let cache: Awaited<ReturnType<typeof getTarballCache>> = null;
+  // started while the tree was still being resolved
+  const prefetched = takePrefetchedTarball(url);
+  if (prefetched) cachedBytes = await prefetched;
   try {
     cache = await getTarballCache();
-    if (cache) cachedBytes = await cache.get(url);
+    if (cache && !cachedBytes) cachedBytes = await cache.get(url);
   } catch {
     cache = null;
   }
 
   if (!cachedBytes) {
-    const response = await proxiedFetch(url);
-    if (!response.ok) {
-      throw new Error(`Archive download failed (HTTP ${response.status}): ${url}`);
-    }
-    cachedBytes = await response.arrayBuffer();
+    cachedBytes = await downloadTarball(url);
   }
 
   if (opts.expectedIntegrity) {
@@ -320,12 +354,19 @@ async function downloadAndExtractInternal(
   };
   channel.port1.start();
 
+  // staging directories this extraction already made (tar entries come
+  // grouped by directory: one mkdir per directory, not per file)
+  const stagedDirs = new Set<string>();
   const writeExtractedFile = (file: ExtractResult["files"][number]): void => {
     if (opts.filter && !opts.filter(file.path)) return;
     const staged = safeJoin(stageRoot, file.path);
     const absolute = safeJoin(destDir, file.path);
     if (!staged || !absolute) return;
-    vol.mkdirSync(path.dirname(staged), { recursive: true });
+    const stagedDir = path.dirname(staged);
+    if (!stagedDirs.has(stagedDir)) {
+      vol.mkdirSync(stagedDir, { recursive: true });
+      stagedDirs.add(stagedDir);
+    }
     const bytes = file.data instanceof Uint8Array
       ? file.data
       : file.isBinary
@@ -334,6 +375,7 @@ async function downloadAndExtractInternal(
     vol.writeFileSync(staged, bytes);
     if (absolute.endsWith(".wasm") && bytes instanceof Uint8Array) precompileWasm(bytes);
     writtenPaths.push(absolute);
+    opts.onFile?.(file.path, bytes);
   };
 
   let result: ExtractResult;
@@ -368,7 +410,9 @@ async function downloadAndExtractInternal(
   if (
     cache &&
     cachedBytes.byteLength > 0 &&
-    cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES
+    cachedBytes.byteLength <= TARBALL_CACHE_MAX_BYTES &&
+    // (one just read back from the cache is already there)
+    shouldRefreshTarball(cachedBytes)
   ) {
     cache.put(url, cachedBytes, opts.expectedShasum).catch(() => {});
   }
@@ -399,14 +443,7 @@ export async function downloadAndExtractDirect(
     cache = null;
   }
 
-  const response = await proxiedFetch(url);
-  if (!response.ok) {
-    throw new Error(
-      `Archive download failed (HTTP ${response.status}): ${url}`,
-    );
-  }
-
-  const rawBytes = await response.arrayBuffer();
+  const rawBytes = await downloadTarball(url);
   if (cache && rawBytes.byteLength > 0 && rawBytes.byteLength <= TARBALL_CACHE_MAX_BYTES) {
     cache.put(url, rawBytes, opts.expectedShasum).catch(() => {});
   }

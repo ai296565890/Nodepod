@@ -108,4 +108,74 @@ describe("AsyncLocalStorage", () => {
     als.disable();
     expect(als.getStore()).toBeUndefined();
   });
+
+  it("a run() scope ends enterWith() done inside it", () => {
+    const a = new AsyncLocalStorage<string>();
+    const b = new AsyncLocalStorage<string>();
+    b.run("b-outer", () => {
+      a.run("a", () => {
+        b.enterWith("b-inner");
+        expect(b.getStore()).toBe("b-inner");
+        expect(a.getStore()).toBe("a");
+      });
+      expect(b.getStore()).toBe("b-outer");
+    });
+  });
+
+  it("continuations keep the context they were registered in", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const seen: string[] = [];
+    await als.run("outer", async () => {
+      const p = Promise.resolve().then(() => {
+        seen.push(als.getStore()!);
+      });
+      const t = new Promise<void>((resolve) =>
+        setTimeout(() => {
+          seen.push(als.getStore()!);
+          resolve();
+        }, 0),
+      );
+      als.enterWith("inner");
+      expect(als.getStore()).toBe("inner");
+      await p;
+      await t;
+    });
+    expect(seen).toEqual(["outer", "outer"]);
+  });
+
+  it("isolates concurrent runs of two storages", async () => {
+    const a = new AsyncLocalStorage<number>();
+    const b = new AsyncLocalStorage<string>();
+    const results = await Promise.all(
+      [1, 2, 3].map((n) =>
+        a.run(n, () =>
+          b.run(`b${n}`, async () => {
+            await new Promise((r) => setTimeout(r, 4 - n));
+            await Promise.resolve();
+            return `${a.getStore()}:${b.getStore()}`;
+          }),
+        ),
+      ),
+    );
+    expect(results).toEqual(["1:b1", "2:b2", "3:b3"]);
+  });
+
+  it("keeps overdue timer continuations isolated through multiple awaits", async () => {
+    const a = new AsyncLocalStorage<number>();
+    const b = new AsyncLocalStorage<string>();
+    for (let round = 0; round < 10; round++) {
+      const pending = [1, 2, 3].map(n =>
+        a.run(n, () => b.run(`b${n}`, async () => {
+          await new Promise<void>(resolve => setTimeout(resolve, 4 - n));
+          for (let step = 0; step < 10; step++) await Promise.resolve();
+          return `${a.getStore()}:${b.getStore()}`;
+        })),
+      );
+      // Make every timer due before the host can run any callback. Different
+      // hosts then dispatch them in different orders; context must not depend on it.
+      const deadline = Date.now() + 6;
+      while (Date.now() < deadline) {}
+      expect(await Promise.all(pending)).toEqual(["1:b1", "2:b2", "3:b3"]);
+    }
+  });
 });

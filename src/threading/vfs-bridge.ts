@@ -3,7 +3,7 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
-import type { VFSBinarySnapshot, VFSSnapshotEntry } from "./worker-protocol";
+import type { VFSBinarySnapshot, VFSSnapshotEntry, WorkerToMain_VFSMeta } from "./worker-protocol";
 import type { SharedVFSController } from "./shared-vfs";
 
 const VFS_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
@@ -15,6 +15,8 @@ export class VFSBridge {
   // suppressed during handleWorkerWrite/Mkdir/Delete to prevent double-broadcasting
   private _suppressWatch = false;
   private _warnedSharedVFSDrop = false;
+  // called after a worker's bulk mount; used to page package packs back out
+  private _onWorkerSnapshot: ((snapshot: VFSBinarySnapshot) => void) | null = null;
 
   constructor(volume: MemoryVolume) {
     this._volume = volume;
@@ -22,6 +24,19 @@ export class VFSBridge {
 
   setBroadcaster(fn: (path: string, content: ArrayBuffer | null, isDirectory: boolean, excludePid: number) => void): void {
     this._broadcaster = fn;
+  }
+
+  // whether any process would receive a broadcast right now: with none (a
+  // process started later gets a snapshot), main-thread writes skip copying
+  // each changed file for nobody
+  private _hasBroadcastTargets: (() => boolean) | null = null;
+
+  setBroadcastTargets(fn: (() => boolean) | null): void {
+    this._hasBroadcastTargets = fn;
+  }
+
+  onWorkerSnapshot(fn: ((snapshot: VFSBinarySnapshot) => void) | null): void {
+    this._onWorkerSnapshot = fn;
   }
 
   setSharedVFS(controller: SharedVFSController, hydrate = false): void {
@@ -47,6 +62,7 @@ export class VFSBridge {
   createSnapshot(opts?: { excludeDirNames?: string[] }): VFSBinarySnapshot {
     const manifest: VFSSnapshotEntry[] = [];
     const chunks: Uint8Array[] = [];
+    const linkedContent = new Map<number, { offset: number; length: number }>();
     let totalSize = 0;
     const exclude =
       opts?.excludeDirNames && opts.excludeDirNames.length > 0
@@ -63,14 +79,20 @@ export class VFSBridge {
           ...metadata,
         });
       } else if (content || metadata?.symlinkTarget !== undefined) {
+        const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+          ? linkedContent.get(metadata.inode)
+          : undefined;
         manifest.push({
           path,
-          offset: totalSize,
-          length: content?.byteLength ?? 0,
+          offset: linked?.offset ?? totalSize,
+          length: linked?.length ?? content?.byteLength ?? 0,
           isDirectory: false,
           ...metadata,
         });
-        if (content) {
+        if (content && !linked) {
+          if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+            linkedContent.set(metadata.inode, { offset: totalSize, length: content.byteLength });
+          }
           chunks.push(content);
           totalSize += content.byteLength;
         }
@@ -92,25 +114,13 @@ export class VFSBridge {
 
   // split into chunks for large transfers
   createChunkedSnapshots(): { chunkIndex: number; totalChunks: number; data: ArrayBuffer; manifest: VFSSnapshotEntry[] }[] {
-    const fullSnapshot = this.createSnapshot();
-    const totalSize = fullSnapshot.data.byteLength;
-
-    if (totalSize <= VFS_CHUNK_SIZE) {
-      return [{
-        chunkIndex: 0,
-        totalChunks: 1,
-        data: fullSnapshot.data,
-        manifest: fullSnapshot.manifest,
-      }];
-    }
-
+    // Build each output directly from the volume. Constructing one full
+    // snapshot first doubled the payload allocation at peak.
     const pending: Array<{ data: ArrayBuffer; manifest: VFSSnapshotEntry[] }> = [];
-    const fullData = new Uint8Array(fullSnapshot.data);
-
-    const metadata = fullSnapshot.manifest.filter(entry => entry.isDirectory || entry.symlinkTarget !== undefined);
-    let entries: VFSSnapshotEntry[] = [...metadata];
+    let entries: VFSSnapshotEntry[] = [];
     let dataParts: Uint8Array[] = [];
     let chunkBytes = 0;
+    const linkedContent = new Map<number, { entries: VFSSnapshotEntry[]; offset: number; length: number }>();
 
     const flush = (): void => {
       if (entries.length === 0) return;
@@ -127,17 +137,32 @@ export class VFSBridge {
       chunkBytes = 0;
     };
 
-    for (const entry of fullSnapshot.manifest) {
-      if (entry.isDirectory || entry.symlinkTarget !== undefined) continue;
-      if (chunkBytes > 0 && chunkBytes + entry.length > VFS_CHUNK_SIZE) flush();
-      const content = fullData.subarray(entry.offset, entry.offset + entry.length);
-      entries.push({ ...entry, offset: chunkBytes });
+    this._walkVolume("/", (path, isDirectory, content, metadata) => {
+      if (isDirectory || metadata?.symlinkTarget !== undefined) {
+        entries.push({ path, offset: 0, length: 0, isDirectory, ...metadata });
+        return;
+      }
+      if (!content) return;
+      const linked = metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1
+        ? linkedContent.get(metadata.inode)
+        : undefined;
+      if (linked) {
+        // Keep all aliases in the chunk owning their payload. That also
+        // preserves hardlinks when chunks are mounted one at a time.
+        linked.entries.push({ path, offset: linked.offset, length: linked.length, isDirectory: false, ...metadata });
+        return;
+      }
+      if (chunkBytes > 0 && chunkBytes + content.byteLength > VFS_CHUNK_SIZE) flush();
+      entries.push({ path, offset: chunkBytes, length: content.byteLength, isDirectory: false, ...metadata });
+      if (metadata?.inode !== undefined && (metadata.nlink ?? 1) > 1) {
+        linkedContent.set(metadata.inode, { entries, offset: chunkBytes, length: content.byteLength });
+      }
       dataParts.push(content);
       chunkBytes += content.byteLength;
-
-    }
+    });
 
     flush();
+    if (pending.length === 0) pending.push({ data: new ArrayBuffer(0), manifest: [] });
     return pending.map((chunk, chunkIndex) => ({
       ...chunk,
       chunkIndex,
@@ -173,6 +198,7 @@ export class VFSBridge {
     } finally {
       this._suppressWatch = false;
     }
+    this._onWorkerSnapshot?.(snapshot);
   }
 
   // writeFile returns false on table/data exhaustion — silent drops mean
@@ -197,6 +223,22 @@ export class VFSBridge {
         `[VFSBridge] SharedVFS write dropped for "${path}" (entries: ${stats.entries}, data: ${stats.dataUsed}/${stats.bufferSize} bytes). ` +
           `Workers may see stale reads. Further drops counted in getStats().droppedWrites.`,
       );
+    }
+  }
+
+  handleWorkerMeta(meta: WorkerToMain_VFSMeta): void {
+    // metadata changes fire no watchers, so there's nothing to suppress
+    try {
+      if (!this._volume.inspectNode(meta.path)) return;
+      if (meta.mode !== undefined) this._volume.lchmodSync(meta.path, meta.mode);
+      if (meta.uid !== undefined && meta.gid !== undefined) {
+        this._volume.lchownSync(meta.path, meta.uid, meta.gid);
+      }
+      if (meta.atimeMs !== undefined && meta.mtimeMs !== undefined) {
+        this._volume.lutimesSync(meta.path, new Date(meta.atimeMs), new Date(meta.mtimeMs));
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Failed to apply metadata for "${meta.path}":`, e);
     }
   }
 
@@ -285,31 +327,47 @@ export class VFSBridge {
       // SharedVFS and broadcast keys are absolute, promote it here.
       const absPath = filename.startsWith("/") ? filename : "/" + filename;
       if (isInternalVfsPath(absPath)) return;
+      if (!this._sharedVFS && this._hasBroadcastTargets && !this._hasBroadcastTargets()) return;
 
-      try {
-        if (this._volume.existsSync(absPath)) {
-          const stat = this._volume.statSync(absPath);
-          if (stat.isDirectory()) {
-            this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
-            if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
-          } else {
-            const data = this._volume.readFileSync(absPath);
-            // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
-            const buffer = new ArrayBuffer(data.byteLength);
-            new Uint8Array(buffer).set(data);
-            this.broadcastChange(absPath, buffer, false, -1);
-            if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
-          }
-        } else {
-          this.broadcastChange(absPath, null, false, -1);
-          if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
-        }
-      } catch (e) {
-        console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
+      // paged-out package content (memory.evictPackageContent): bring it
+      // back in, then broadcast it
+      if (this._volume.isPagedOut(absPath)) {
+        void this._volume
+          .ensureResident(absPath)
+          .then(() => this._broadcastPath(absPath))
+          .catch((e) => console.warn(`[VFSBridge] Watch error for "${absPath}":`, e));
+        return;
       }
+      this._broadcastPath(absPath);
     });
 
     return () => handle.close();
+  }
+
+  private _broadcastPath(absPath: string): void {
+    try {
+      // existence and kind in one lookup, no stat object
+      const kind = this._volume.kindSync(absPath);
+      if (kind !== null) {
+        if (kind === "directory") {
+          this.broadcastChange(absPath, new ArrayBuffer(0), true, -1);
+          if (this._sharedVFS) this._sharedVFSWriteDirectory(absPath);
+        } else {
+          // a copy for other threads, not a use: packed files stay packed
+          const data = this._volume.peekFileSync(absPath);
+          // fresh ArrayBuffer copy — VFS nodes may store SAB-backed Uint8Arrays when written from WASM threads, and SAB isn't transferable via postMessage
+          const buffer = new ArrayBuffer(data.byteLength);
+          new Uint8Array(buffer).set(data);
+          this.broadcastChange(absPath, buffer, false, -1);
+          if (this._sharedVFS) this._sharedVFSWrite(absPath, data);
+        }
+      } else {
+        this.broadcastChange(absPath, null, false, -1);
+        if (this._sharedVFS) this._sharedVFS.deleteFile(absPath);
+      }
+    } catch (e) {
+      console.warn(`[VFSBridge] Watch error for "${absPath}":`, e);
+    }
   }
 
   private _walkVolume(
@@ -343,7 +401,8 @@ export class VFSBridge {
             if (excludeDirNames?.has(name)) continue;
             this._walkVolume(fullPath, visitor, excludeDirNames);
           } else {
-            const content = this._volume.readFileSync(fullPath);
+            // a bulk copy: packed package files stay packed
+            const content = this._volume.peekFileSync(fullPath);
             visitor(fullPath, false, content, metadata);
           }
         } catch (e) {

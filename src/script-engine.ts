@@ -9,10 +9,12 @@ import type {
   LoadedModule,
 } from "./engine-types";
 import type { PackageManifest } from "./types/manifest";
-import { quickDigest } from "./helpers/digest";
+import { quickDigest, contentDigest } from "./helpers/digest";
 import { createImportMeta } from "./helpers/import-meta";
 import { LRUCache as _LRUCache } from "./memory-handler";
-import { bytesToBase64, bytesToHex } from "./helpers/byte-encoding";
+import { bytesToBase64, bytesToHex, decodeShortAscii } from "./helpers/byte-encoding";
+import { inSyncScope, syncScopeDepth, setSyncPromiseClass } from "./helpers/sync-scope";
+import { guardExitCallback, guardExitRejection, installPromiseExitGuard } from "./helpers/promise-exit";
 import { buildFileSystemBridge, FsBridge } from "./polyfills/fs";
 import * as pathPolyfill from "./polyfills/path";
 import {
@@ -21,8 +23,11 @@ import {
   INDEX_FILES,
   IMPORTS_FIELD_EXTENSIONS,
 } from "./constants/config";
+// a module path's candidate extensions, in probe order
+const FILE_EXTENSIONS_WITH_NODE: readonly string[] = [...MAIN_FIELD_EXTENSIONS, ".node"];
 import { buildProcessEnv, ProcessObject } from "./polyfills/process";
 import * as httpPolyfill from "./polyfills/http";
+import { proxyUrlForFetch } from "./cross-origin";
 import {
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
@@ -43,7 +48,22 @@ import * as osPolyfill from "./polyfills/os";
 import * as hashingPolyfill from "./polyfills/crypto";
 import * as compressionPolyfill from "./polyfills/zlib";
 import * as dnsPolyfill from "./polyfills/dns";
-import bufferPolyfill from "./polyfills/buffer";
+import bufferPolyfill, { Buffer as NodeBuffer } from "./polyfills/buffer";
+// Descriptor for a Proxy that forwards to `source` over an empty target. The
+// target never has the property, so reporting it non-configurable breaks the
+// Proxy invariant and throws. ES module namespaces (the lazily imported
+// child_process polyfill) and esbuild's __export getters are non-configurable,
+// and esbuild's __toESM reads every descriptor (zx: `'getOwnPropertyDescriptor'
+// on proxy: trap reported non-configurability for property 'ShellProcess'`).
+function forwardedDescriptor(
+  source: object,
+  prop: string | symbol,
+): PropertyDescriptor | undefined {
+  const desc = Object.getOwnPropertyDescriptor(source, prop);
+  if (desc) desc.configurable = true;
+  return desc;
+}
+
 // child_process is lazy-loaded to avoid pulling in the shell at import time
 let _shellExecPolyfill: any = null;
 let _initShellExec: ((vol: any) => void) | null = null;
@@ -58,7 +78,7 @@ const shellExecProxy = new Proxy({} as any, {
   },
   getOwnPropertyDescriptor(_target, prop) {
     if (!_shellExecPolyfill) return undefined;
-    return Object.getOwnPropertyDescriptor(_shellExecPolyfill, prop);
+    return forwardedDescriptor(_shellExecPolyfill, prop);
   },
   has(_target, prop) {
     if (!_shellExecPolyfill) return false;
@@ -126,12 +146,15 @@ import {
 } from "resolve.exports";
 import {
   esmToCjs,
+  applyPatches,
   collectEsmCjsPatches,
   hasTopLevelAwait,
   stripTopLevelAwait,
+  topLevelParser,
 } from "./syntax-transforms";
 import {
   getCachedModule,
+  cloneCachedModule,
   precompileWasm,
   compileWasmInWorker,
   registerCompiledModule,
@@ -144,6 +167,11 @@ import {
 import { getRegistry } from "./helpers/event-loop";
 import * as acorn from "acorn";
 import { isTypeScriptFile, stripTypeScript } from "./strip-typescript";
+import {
+  lexModule,
+  hasStaticModuleSyntax,
+  patchDynamicImports,
+} from "./helpers/module-lexer";
 
 // CSS files must never go through stripTypeScript
 function isCSSFile(filename: string): boolean {
@@ -232,38 +260,69 @@ function pickModuleExportName(source: string): string {
   return candidate;
 }
 
-function astHasTopLevelAwait(ast: any): boolean {
-  let found = false;
-  let insideAsync = 0;
-  const walk = (node: any): void => {
-    if (found || !node || typeof node !== "object") return;
-    if (Array.isArray(node)) {
-      for (const child of node) walk(child);
-      return;
+// Static imports and re-exports of a module the engine converts load through
+// this binding (declared by buildModuleWrapper): a name the source can't
+// hold, like the module binding it derives from.
+function importCallName(moduleExportName: string): string {
+  return `${moduleExportName}_import`;
+}
+
+/** Specifiers of a converted module's static imports and re-exports, in order. */
+function staticImportsOf(code: string, moduleExportName: string): string[] {
+  const call = importCallName(moduleExportName) + "(";
+  if (!code.includes(call)) return [];
+  const specs: string[] = [];
+  // the conversion writes each specifier with JSON.stringify
+  const re = new RegExp(`\\b${importCallName(moduleExportName)}\\(("(?:[^"\\\\\\n]|\\\\.)*")\\)`, "g");
+  for (const m of code.matchAll(re)) specs.push(JSON.parse(m[1]));
+  return specs;
+}
+
+// Modules evaluating asynchronously: ones with top-level await loaded by an
+// import that can wait for them, and the modules importing those. Whoever
+// imports one waits for this before running its own body.
+const pendingEvaluations = new WeakMap<ModuleRecord, Promise<void>>();
+
+/** Thrown by a static import of a module still evaluating (see runModuleBody). */
+class ImportPending {
+  constructor(readonly ready: Promise<void>) {}
+}
+
+/**
+ * Runs a module body whose static imports may evaluate asynchronously. An
+ * import of a module still evaluating stops the body (ImportPending; imports
+ * are its first statements, after only the hoisted function exports cyclic
+ * importers rely on), the rest of its imports load, and once they are done
+ * the body runs again, finding them all evaluated. Null when the body
+ * finished synchronously.
+ */
+function runModuleBody(
+  evaluate: () => unknown,
+  isAsync: boolean,
+  loadImports: () => Promise<void> | null,
+): Promise<void> | null {
+  let wait: Promise<void> | null = null;
+  if (!isAsync) {
+    try {
+      evaluate();
+      return null;
+    } catch (err) {
+      if (!(err instanceof ImportPending)) throw err;
+      wait = loadImports() ?? err.ready;
     }
-    if (typeof node.type !== "string") return;
-    const isAsyncFn =
-      (node.type === "FunctionDeclaration" ||
-        node.type === "FunctionExpression" ||
-        node.type === "ArrowFunctionExpression") && node.async;
-    if (isAsyncFn) insideAsync++;
-    if (
-      (node.type === "AwaitExpression" ||
-        (node.type === "ForOfStatement" && node.await)) &&
-      insideAsync === 0
-    ) {
-      found = true;
-    }
-    if (!found) {
-      for (const key of Object.keys(node)) {
-        if (key === "type" || key === "start" || key === "end") continue;
-        walk(node[key]);
+  }
+  return (async () => {
+    for (;;) {
+      if (wait) await wait;
+      try {
+        await evaluate();
+        return;
+      } catch (err) {
+        if (!(err instanceof ImportPending)) throw err;
+        wait = loadImports() ?? err.ready;
       }
     }
-    if (isAsyncFn) insideAsync--;
-  };
-  walk(ast);
-  return found;
+  })();
 }
 
 function convertModuleSyntaxDetailed(
@@ -293,25 +352,35 @@ function convertViaAst(
   filePath: string,
   moduleExportName: string,
 ): { code: string; hasTLA: boolean } {
-  const ast = acorn.parse(source, {
+  // collect import.meta and import() patches: the lexer finds them in one
+  // tokenizer pass, where walking every node of the AST cost about as much
+  // again as a large chunk's parse
+  const lexed = source.length <= LEXER_MAX_CHARS ? lexModule(source) : null;
+  const ast = (lexed ? topLevelParser() : acorn.Parser).parse(source, {
     ecmaVersion: "latest",
     sourceType: "module",
   }) as any;
   const patches: Array<[number, number, string]> = [];
 
-  // collect import.meta and import() patches
-  traverseAst(ast, (node: any) => {
-    if (
-      node.type === "MetaProperty" &&
-      node.meta?.name === "import" &&
-      node.property?.name === "meta"
-    ) {
-      patches.push([node.start, node.end, "import_meta"]);
+  if (lexed) {
+    for (const imp of lexed[0]) {
+      if (imp.d === -2) patches.push([imp.ss, imp.se, "import_meta"]);
+      else if (imp.t === 2 && imp.d > -1) patches.push([imp.ss, imp.ss + 6, "__asyncLoad"]);
     }
-    if (node.type === "ImportExpression") {
-      patches.push([node.start, node.start + 6, "__asyncLoad"]);
-    }
-  });
+  } else {
+    traverseAst(ast, (node: any) => {
+      if (
+        node.type === "MetaProperty" &&
+        node.meta?.name === "import" &&
+        node.property?.name === "meta"
+      ) {
+        patches.push([node.start, node.end, "import_meta"]);
+      }
+      if (node.type === "ImportExpression") {
+        patches.push([node.start, node.start + 6, "__asyncLoad"]);
+      }
+    });
+  }
 
   const hasImportDecl = ast.body.some(
     (n: any) => n.type === "ImportDeclaration",
@@ -322,14 +391,13 @@ function convertViaAst(
   if (hasImportDecl || hasExportDecl) {
     collectEsmCjsPatches(ast, source, patches, {
       exportTarget: `${moduleExportName}.exports`,
+      importCall: moduleExportName === "module" ? undefined : importCallName(moduleExportName),
+      liveImports: true,
     });
   }
 
   // apply all patches in one pass
-  let output = source;
-  patches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-  for (const [s, e, r] of patches)
-    output = output.slice(0, s) + r + output.slice(e);
+  let output = applyPatches(source, patches);
 
   if (hasExportDecl) {
     // wrapper sets __esModule in outer scope (see ESM_SENTINEL). doing it
@@ -340,11 +408,191 @@ function convertViaAst(
   // .mjs files with `const require = createRequire(...)` hit TDZ after esmToCjs
   output = demoteLexicalRequire(output);
 
-  return { code: output, hasTLA: astHasTopLevelAwait(ast) };
+  return {
+    code: output,
+    hasTLA: RE_AWAIT_WORD.test(source) && moduleAstHasTopLevelAwait(ast),
+  };
+}
+
+// Top-level await in a module AST. Function bodies are skipped outright: in
+// module code `await` inside any non-async function is a parse error, and
+// inside an async one it isn't top level, so only statements outside
+// functions can hold it. Most of a module's code sits in functions, which
+// makes this a small fraction of a full walk.
+function moduleAstHasTopLevelAwait(ast: any): boolean {
+  let found = false;
+  const walk = (node: any): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const child of node) walk(child);
+      return;
+    }
+    switch (node.type) {
+      case "FunctionDeclaration":
+      case "FunctionExpression":
+      case "ArrowFunctionExpression":
+        return;
+      case "AwaitExpression":
+        found = true;
+        return;
+      case "ForOfStatement":
+        if (node.await) {
+          found = true;
+          return;
+        }
+        break;
+      default:
+        if (typeof node.type !== "string") return;
+    }
+    for (const key in node) {
+      if (key === "type" || key === "start" || key === "end") continue;
+      const value = node[key];
+      if (value && typeof value === "object") walk(value);
+    }
+  };
+  walk(ast);
+  return found;
 }
 
 // stamped by convertModuleSyntax, stripped by buildModuleWrapper. #56
 const ESM_SENTINEL = "/*@nodepod-esm*/\n";
+
+const RE_AWAIT_WORD = /\bawait\b/;
+// `await (x)` / `await [x]` at the start of a line, outside any function:
+// sloppy-mode script parses it as a call of a function named await, so
+// nothing flags it; the full path detects and strips top-level await
+const RE_TOPLEVEL_AWAIT_CALL = /^(?:(?:const|let|var)\s+[\w$]+\s*=\s*|[\w$.]+\s*=\s*)?await\s*[([]/m;
+// the lexer's memory grows to about 4 bytes per source char and stays at
+// its peak: bigger sources take the AST path (their parse is transient)
+const LEXER_MAX_CHARS = 2_000_000;
+
+declare const __NODEPOD_BUILD_ID__: string | undefined;
+
+// Transform caches store this instead of code when the transform left the
+// source unchanged (most CommonJS in node_modules): the loader has the source
+// in hand already, so a second copy would only cost memory and transfer.
+// transform flags: 1 top-level await, 2 lexer fast path, 4 the transform
+// left the source as it was (no code stored)
+const FLAG_SAME_AS_SOURCE = 4;
+// a cached transform is one string: a flags character, then the code
+const CACHED_FLAGS_BASE = 0x30;
+function encodeCachedTransform(code: string | null, hasTLA: boolean, fast: boolean): string {
+  const flags = (hasTLA ? 1 : 0) | (fast ? 2 : 0) | (code === null ? FLAG_SAME_AS_SOURCE : 0);
+  return String.fromCharCode(CACHED_FLAGS_BASE + flags) + (code ?? "");
+}
+
+// ── Shared transform store (see threading/transform-store.ts) ──
+
+type SharedTransformClient = {
+  loadPack(scope: string): Array<[string, string, number]>;
+  put(scope: string, key: string, code: string, flags: number): void;
+};
+
+function getSharedTransformClient(): SharedTransformClient | null {
+  return (
+    (globalThis as { __nodepodSharedTransforms?: SharedTransformClient })
+      .__nodepodSharedTransforms ?? null
+  );
+}
+
+// packs fetched over each client (one per process); entries are handed out
+// once (each module loads once per process) so a pack's strings don't
+// outlive their use
+const _sharedPacks = new WeakMap<SharedTransformClient, Map<string, Map<string, [string, number]>>>();
+// the entries a process never takes (modules of a package it doesn't load)
+// are dropped once it stops loading modules; a later load asks again
+const SHARED_PACK_IDLE_MS = 5000;
+const _sharedPackRelease = new WeakMap<SharedTransformClient, { timer: ReturnType<typeof setTimeout>; at: number }>();
+
+function scheduleSharedPackRelease(client: SharedTransformClient): void {
+  const now = Date.now();
+  const pending = _sharedPackRelease.get(client);
+  if (pending && now - pending.at < 1000) return;
+  if (pending) clearTimeout(pending.timer);
+  const timer = setTimeout(() => {
+    _sharedPackRelease.delete(client);
+    _sharedPacks.delete(client);
+  }, SHARED_PACK_IDLE_MS);
+  // in process workers setTimeout is the node timers polyfill: this timer
+  // must not keep the process alive
+  (timer as unknown as { unref?: () => void }).unref?.();
+  _sharedPackRelease.set(client, { timer, at: now });
+}
+
+function takeSharedTransform(
+  client: SharedTransformClient,
+  scope: string,
+  key: string,
+): [string, number] | null {
+  scheduleSharedPackRelease(client);
+  let packs = _sharedPacks.get(client);
+  if (!packs) _sharedPacks.set(client, (packs = new Map()));
+  let pack = packs.get(scope);
+  if (!pack) {
+    pack = new Map();
+    for (const [k, code, flags] of client.loadPack(scope)) pack.set(k, [code, flags]);
+    packs.set(scope, pack);
+  }
+  const hit = pack.get(key);
+  if (!hit) return null;
+  pack.delete(key);
+  return hit;
+}
+
+// Digest of the transform implementation itself: persisted transforms made
+// by different transform code never match.
+let _transformSalt: string | null = null;
+function transformSalt(): string {
+  if (_transformSalt === null) {
+    // the build id changes with every build (a helper not listed below may
+    // change); the digest covers unbundled runs such as tests
+    const build = typeof __NODEPOD_BUILD_ID__ === "string" ? __NODEPOD_BUILD_ID__ : "dev";
+    _transformSalt = build + "." + quickDigest(
+      [
+        convertModuleSyntaxDetailed,
+        convertViaAst,
+        topLevelParser,
+        convertViaRegex,
+        collectEsmCjsPatches,
+        applyPatches,
+        demoteLexicalRequire,
+        pickModuleExportName,
+        fastCommonJsTransform,
+        patchDynamicImports,
+        stripTypeScript,
+      ]
+        .map(String)
+        .join("|"),
+    );
+  }
+  return _transformSalt;
+}
+
+/**
+ * Loader fast path for CommonJS: when the lexer finds no static
+ * import/export, the module only needs `import()` / `import.meta` rewritten,
+ * which the lexer's positions give directly. Returns null when the module
+ * needs the full AST transform: it has module syntax, or it lives in an ESM
+ * context (.mjs, `"type": "module"`) and may use top-level await.
+ */
+function fastCommonJsTransform(
+  code: string,
+  filePath: string,
+  isTypeModuleDir: (dir: string) => boolean,
+): string | null {
+  if (code.length > LEXER_MAX_CHARS) return null;
+  // .cts may keep import/export after type stripping: check it like .js
+  const explicitCjs = filePath.endsWith(".cjs");
+  if (!explicitCjs && RE_AWAIT_WORD.test(code)) {
+    if (/\.m[jt]s$/.test(filePath)) return null;
+    if (isTypeModuleDir(pathPolyfill.dirname(filePath))) return null;
+    if (RE_TOPLEVEL_AWAIT_CALL.test(code)) return null;
+  }
+  const lexed = lexModule(code);
+  if (!lexed) return null;
+  if (!explicitCjs && hasStaticModuleSyntax(lexed)) return null;
+  return patchDynamicImports(code, lexed);
+}
 
 // Demote `const/let require =` to plain assignment to avoid TDZ with esmToCjs-generated require() calls
 function demoteLexicalRequire(code: string): string {
@@ -383,7 +631,7 @@ function buildModuleWrapper(
   let vars = `var exports = $exports;
 var require = $require;
 var module = $module;
-${moduleExportName ? `var ${moduleExportName} = $module;\n` : ""}var __filename = $filename;
+${moduleExportName ? `var ${moduleExportName} = $module;\nvar ${importCallName(moduleExportName)} = $require.esm || $require;\n` : ""}var __filename = $filename;
 var __dirname = $dirname;
 `;
   if (includeViteVars) {
@@ -396,7 +644,11 @@ var __vite_injected_original_import_meta_url = "file://" + $filename;
 var console = $console;
 var import_meta = $importMeta;
 var __asyncLoad = $asyncLoad;
+var __liveImport = $require && $require.__liveImport;
+var Function = ($asyncLoad && $asyncLoad.Function) || globalThis.Function;
 var __syncAwait = $syncAwait;
+var __syncAwaitFn = $syncAwaitFn;
+var __asyncBody = $syncAwaitFn && $syncAwaitFn.asyncBody;
 var Promise = ${promiseVar};
 var global = globalThis;
 `;
@@ -431,10 +683,10 @@ async function __wasmInstantiate(moduleOrBytes, imports) {
 `;
   }
 
-  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $SyncPromise) {
+  return `(function($exports, $require, $module, $filename, $dirname, $process, $console, $importMeta, $asyncLoad, $syncAwait, $syncAwaitFn, $SyncPromise) {
 ${vars}return (${fnKeyword}() {
 ${code}
-}).call(this);
+}).call(${isEsmModule ? "this" : "$exports"});
 })`;
 }
 
@@ -580,6 +832,7 @@ function convertViaRegex(
   if (hasImport || hasExport) {
     output = esmToCjs(output, {
       exportTarget: `${moduleExportName}.exports`,
+      liveImports: true,
     });
     if (hasExport) {
       // see ESM_SENTINEL above. #56
@@ -590,6 +843,214 @@ function convertViaRegex(
   output = demoteLexicalRequire(output);
 
   return output;
+}
+
+// ── fetch body lifetime ──
+// A fetch() Handle covers the request until headers arrive. Reading the body
+// afterwards (`await r.text()`, `.json()`, a reader loop) completes from
+// browser tasks that no tracked Handle refs, so a script whose last live work
+// is a body read would be judged drained and exit before the bytes land.
+// Node keeps the socket alive until the body is consumed; mirror that by
+// holding a Handle for the duration of each body-consuming call. Nothing is
+// registered while the body sits unread, so a script that only inspects
+// `r.status` still exits promptly.
+const BODY_CONSUMERS = ["text", "json", "arrayBuffer", "blob", "bytes", "formData"] as const;
+
+function trackFetchBodyConsumption(resp: Response): Response {
+  if (!resp || typeof resp !== "object" || !resp.body) return resp;
+  const define = (target: object, name: string, value: unknown) => {
+    try {
+      Object.defineProperty(target, name, {
+        configurable: true,
+        writable: true,
+        value,
+      });
+    } catch {
+      /* frozen/exotic response: leave native behavior */
+    }
+  };
+  const holdUntilSettled = <T>(p: Promise<T>): Promise<T> => {
+    const handle = getRegistry().register("FetchRequest");
+    return p.then(
+      (v) => {
+        handle.close();
+        return v;
+      },
+      (e) => {
+        handle.close();
+        throw e;
+      },
+    );
+  };
+  for (const name of BODY_CONSUMERS) {
+    const orig = (resp as unknown as Record<string, unknown>)[name];
+    if (typeof orig !== "function") continue;
+    define(resp, name, function (this: Response, ...args: unknown[]) {
+      return holdUntilSettled(
+        (orig as (...a: unknown[]) => Promise<unknown>).apply(this, args),
+      );
+    });
+  }
+  // clone(): the copy gets its own tracking.
+  const origClone = resp.clone;
+  if (typeof origClone === "function") {
+    define(resp, "clone", function (this: Response) {
+      return trackFetchBodyConsumption(origClone.call(this));
+    });
+  }
+  // Manual streaming: a reader or pipe holds the Handle until the stream
+  // closes, errors, or is cancelled.
+  const body = resp.body;
+  const origGetReader = body.getReader;
+  if (typeof origGetReader === "function") {
+    define(body, "getReader", function (this: ReadableStream, ...args: unknown[]) {
+      const reader = (origGetReader as (...a: unknown[]) => ReadableStreamDefaultReader).apply(this, args);
+      const handle = getRegistry().register("FetchRequest");
+      const release = () => handle.close();
+      reader.closed.then(release, release);
+      return reader;
+    });
+  }
+  const origPipeTo = body.pipeTo;
+  if (typeof origPipeTo === "function") {
+    define(body, "pipeTo", function (this: ReadableStream, ...args: unknown[]) {
+      return holdUntilSettled(
+        (origPipeTo as (...a: unknown[]) => Promise<void>).apply(this, args),
+      );
+    });
+  }
+  return resp;
+}
+
+// ── fetch() → virtual server ──
+
+interface LoopbackTarget {
+  port: number;
+  path: string;
+}
+
+function parseLoopbackHttpUrl(url: string): LoopbackTarget | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!httpPolyfill.isLoopbackHostname(parsed.hostname)) return null;
+  const port = parsed.port
+    ? Number(parsed.port)
+    : parsed.protocol === "https:"
+      ? 443
+      : 80;
+  if (!Number.isFinite(port) || port <= 0) return null;
+  return { port, path: parsed.pathname + parsed.search };
+}
+
+const MAX_LOCAL_REDIRECTS = 20;
+
+/**
+ * Serve a fetch() aimed at a loopback port from the virtual server bound to
+ * it. Resolves `null` when nothing listens there so the caller can fall back
+ * to the network. Follows same-loopback redirects like a real fetch would.
+ */
+async function fetchVirtualServer(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  target: LoopbackTarget,
+): Promise<Response | null> {
+  const request = new Request(input as RequestInfo, init);
+  const method = request.method.toUpperCase();
+  const headers: Record<string, string> = {};
+  request.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  let body: Buffer | undefined;
+  if (method !== "GET" && method !== "HEAD") {
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength > 0) body = NodeBuffer.from(bytes);
+  }
+  const redirectMode = request.redirect ?? "follow";
+
+  let current = target;
+  let currentMethod = method;
+  let currentBody = body;
+  for (let hop = 0; hop <= MAX_LOCAL_REDIRECTS; hop++) {
+    if (!headers.host) headers.host = `localhost:${current.port}`;
+    const result = await httpPolyfill.dispatchLocalRequest(
+      current.port,
+      currentMethod,
+      current.path,
+      headers,
+      currentBody,
+    );
+    if (!result) return hop === 0 ? null : Response.error();
+
+    const responseHeaders = new Headers();
+    for (const [key, value] of Object.entries(result.headers ?? {})) {
+      if (Array.isArray(value)) {
+        for (const item of value) responseHeaders.append(key, String(item));
+      } else if (value != null) {
+        responseHeaders.append(key, String(value));
+      }
+    }
+    // Response() rejects statuses outside 200-599; anything else from a
+    // virtual server is a protocol error, report it as a bad gateway
+    const rawStatus = result.statusCode || 200;
+    const status = rawStatus >= 200 && rawStatus <= 599 ? rawStatus : 502;
+    const location = responseHeaders.get("location");
+    const isRedirect = [301, 302, 303, 307, 308].includes(status) && !!location;
+    if (isRedirect && redirectMode === "follow") {
+      let next: LoopbackTarget | null = null;
+      try {
+        next = parseLoopbackHttpUrl(
+          new URL(location, `http://localhost:${current.port}${current.path}`).href,
+        );
+      } catch {
+        next = null;
+      }
+      // redirect off the loopback: hand the rest to the network
+      if (!next) return null;
+      if (status === 303 || ((status === 301 || status === 302) && currentMethod === "POST")) {
+        currentMethod = "GET";
+        currentBody = undefined;
+        delete headers["content-length"];
+        delete headers["content-type"];
+      }
+      delete headers.host;
+      current = next;
+      continue;
+    }
+    if (isRedirect && redirectMode === "error") {
+      throw new TypeError("Failed to fetch: redirect not allowed");
+    }
+
+    // null-body statuses cannot carry a body in a Response
+    const nullBody = status === 204 || status === 205 || status === 304 || currentMethod === "HEAD";
+    const payload = result.body;
+    const bodyInit =
+      nullBody || !payload || payload.byteLength === 0
+        ? null
+        : (payload.buffer.slice(
+            payload.byteOffset,
+            payload.byteOffset + payload.byteLength,
+          ) as ArrayBuffer);
+    const response = new Response(bodyInit, {
+      status,
+      statusText: result.statusMessage || "",
+      headers: responseHeaders,
+    });
+    try {
+      Object.defineProperty(response, "url", {
+        configurable: true,
+        value: `http://localhost:${current.port}${current.path}`,
+      });
+    } catch {
+      /* url stays "" */
+    }
+    return response;
+  }
+  throw new TypeError("Failed to fetch: too many redirects");
 }
 
 // ── Sync promise infrastructure ──
@@ -607,8 +1068,14 @@ class SyncThenable<T> {
     onFulfilled?: ((v: T) => R) | null,
     _onRejected?: ((e: any) => R) | null,
   ): SyncThenable<R> | this {
-    if (onFulfilled) return new SyncThenable(onFulfilled(this._value));
-    return this;
+    if (!onFulfilled) return this;
+    const result = onFulfilled(this._value);
+    // like a promise, adopt a thenable the callback returns (a CJS shim's
+    // `import("./index.js").then((m) => m.fn())` hands back fn's promise)
+    if (result && typeof (result as { then?: unknown }).then === "function") {
+      return result as unknown as SyncThenable<R>;
+    }
+    return new SyncThenable(result);
   }
   catch(_onRejected?: ((e: any) => unknown) | null): this {
     return this;
@@ -621,18 +1088,89 @@ class SyncThenable<T> {
 
 // Try to synchronously unwrap a thenable. Returns the value if .then() fires sync,
 // otherwise returns the original value (possibly a native Promise).
+// The synchronous fast-path in SyncPromise.then below is gated on this scope:
+// user-code .then calls outside of it keep native microtask timing (Node parity),
+// while require() machinery unwrapping inside it keeps working synchronously.
+// (The scope lives in helpers/sync-scope so polyfills can see it too.)
 function syncAwait(val: unknown): unknown {
-  if (val && typeof (val as any).then === "function") {
-    let resolved: unknown;
-    let gotSync = false;
-    (val as any).then((v: unknown) => {
-      resolved = v;
-      gotSync = true;
-    });
-    if (gotSync) return resolved;
+  // like `await`, a thenable resolved with another thenable is followed on
+  // (bounded, against thenables that resolve to themselves)
+  for (let hops = 0; hops < 32; hops++) {
+    const next = syncAwaitOnce(val);
+    if (next === val || !next || typeof (next as { then?: unknown }).then !== "function") return next;
+    val = next;
   }
   return val;
 }
+
+function syncAwaitOnce(val: unknown): unknown {
+  if (val && typeof (val as any).then === "function") {
+    let resolved: unknown;
+    let gotSync = false;
+    let rejected = false;
+    let error: unknown;
+    // only a SyncPromise can report a rejection synchronously; a rejection
+    // handler on a pending native promise would just swallow its error
+    const onRejected =
+      (val as any)._force === (SyncPromiseClass.prototype as any)._force
+        ? (e: unknown) => {
+            error = e;
+            rejected = true;
+          }
+        : undefined;
+    const derived = inSyncScope(() =>
+      (val as any).then((v: unknown) => {
+        resolved = v;
+        gotSync = true;
+      }, onRejected),
+    );
+    // val itself goes back to the caller, who handles its rejection; the
+    // promise this .then() made must not report it again as unhandled
+    if (!onRejected && derived && typeof derived.then === "function") {
+      derived.then(undefined, () => {});
+    }
+    if (gotSync) return resolved;
+    // `await` of a rejected promise throws at the await site
+    if (rejected) throw error;
+  }
+  return val;
+}
+
+/**
+ * Thunk form emitted by the TLA transform: `await EXPR` compiles to
+ * `__syncAwaitFn(() => (EXPR))`. The whole argument — including any
+ * `.then` chains — evaluates inside the sync scope, so chained promises
+ * unwrap synchronously exactly like values passed to `syncAwait`.
+ * Genuinely async values behave as before (returned pending).
+ */
+function syncAwaitFn(thunk: () => unknown): unknown {
+  return inSyncScope(() => syncAwait(thunk()));
+}
+
+/**
+ * Body of an async function under the full de-async transform
+ * (`__asyncBody(() => { BODY })`): it runs right away, its awaits unwrapped,
+ * and the function returns a promise already settled with the outcome, so
+ * callers can still .then()/.catch() it and an await of it unwraps at once.
+ */
+function asyncBody(body: () => unknown): Promise<unknown> {
+  let value: unknown;
+  try {
+    value = inSyncScope(body);
+  } catch (error) {
+    return new SyncPromiseClass((_resolve, reject) => reject(error));
+  }
+  return new SyncPromiseClass((resolve) => resolve(value));
+}
+/**
+ * Async function in a module with top-level await (the "scoped" transform):
+ * called while a top-level await is being unwrapped it runs de-asynced, so
+ * `await f()` settles on the spot; any other call stays natively async.
+ */
+asyncBody.pick = (deAsynced: () => unknown, native: () => Promise<unknown>): Promise<unknown> =>
+  syncScopeDepth() > 0 ? asyncBody(deAsynced) : native();
+// reaches module wrappers alongside syncAwaitFn (see buildModuleWrapper)
+(syncAwaitFn as typeof syncAwaitFn & { asyncBody?: typeof asyncBody }).asyncBody = asyncBody;
 
 // Promise subclass that resolves .then() synchronously when the executor resolves sync.
 // Needed because async functions always return native Promises, but when their body
@@ -646,12 +1184,26 @@ function createSyncPromise(): typeof Promise {
   // async plugin hooks (rolldown/vite and other napi clients) are awaited
   // instead of being decoded as ordinary objects.
   const NativePromise = asyncCtxPolyfill.getNativePromiseConstructor();
+  const noop = (): void => {};
+  const markHandled = (p: Promise<unknown>): void => {
+    NativePromise.prototype.then.call(p, undefined, noop);
+  };
+  const isSyncPromise = (v: unknown): v is SyncPromise<any> =>
+    !!v &&
+    typeof v === "object" &&
+    (v as any)._force === SyncPromise.prototype._force;
 
   class SyncPromise<T> extends NativePromise<T> {
     private _syncValue: T | undefined;
     private _syncResolved = false;
     private _syncRejected = false;
     private _syncError: any;
+
+    // Set on promises whose value can be computed ahead of native timing:
+    // .then() results created outside a sync scope, and promises adopting
+    // one of those. syncAwait forces them so a chain built before a
+    // top-level `await` still unwraps synchronously.
+    private _lazy?: () => void;
 
     constructor(
       executor: (
@@ -663,10 +1215,18 @@ function createSyncPromise(): typeof Promise {
       let syncResolved = false;
       let syncRejected = false;
       let syncErr: any;
+      let adopted: SyncPromise<T> | undefined;
 
       super((resolve, reject) => {
         executor(
           (value) => {
+            // Adopting a SyncPromise outside a sync scope: keep native
+            // adoption timing, but remember the source so it can be forced.
+            if (syncScopeDepth() === 0 && isSyncPromise(value)) {
+              adopted = value;
+              resolve(value);
+              return;
+            }
             // Try sync unwrap. If it can't resolve sync, let native handle it.
             // Without this, p-limit's resolve(asyncPromise) gets treated as
             // sync-resolved with the Promise object as the value.
@@ -721,17 +1281,141 @@ function createSyncPromise(): typeof Promise {
       this._syncRejected = syncRejected;
       this._syncError = syncErr;
 
-      // Suppress native unhandledrejection — our .then() handles these sync
-      if (syncRejected) {
-        NativePromise.prototype.catch.call(this, () => {});
+      // No blanket rejection suppression here: an unhandled rejection has to
+      // reach the host's unhandledrejection event (node exits 1 on it).
+      // Rejections consumed on a sync path are marked handled there instead.
+      if (adopted) {
+        const src = adopted;
+        this._lazy = () => {
+          src._force();
+          if (src._syncResolved) {
+            this._syncResolved = true;
+            this._syncValue = src._syncValue;
+          } else if (src._syncRejected) {
+            this._syncRejected = true;
+            this._syncError = src._syncError;
+          }
+        };
       }
+    }
+
+    _force(): void {
+      const lazy = this._lazy;
+      if (lazy && !this._syncResolved && !this._syncRejected) {
+        lazy();
+        // settled: drop the link so a long chain doesn't keep its parents alive
+        if (this._syncResolved || this._syncRejected) this._lazy = undefined;
+      }
+    }
+
+    // .then() outside a sync scope on a promise whose value is (or can be)
+    // known synchronously. The reaction is a real native one, so timing
+    // matches node; _lazy lets syncAwait compute the same result early.
+    // Either way the callback runs at most once.
+    private _lazyThen(
+      onFulfilled?: ((value: T) => any) | null,
+      onRejected?: ((reason: any) => any) | null,
+    ): Promise<any> {
+      let state = 0; // 0 pending, 1 fulfilled, 2 rejected
+      let out: any;
+      const settle = (ok: boolean, v: any): void => {
+        if (state !== 0) return;
+        try {
+          if (ok) out = onFulfilled ? onFulfilled(v) : v;
+          else if (onRejected) out = onRejected(v);
+          else {
+            state = 2;
+            out = v;
+            return;
+          }
+          state = 1;
+        } catch (e) {
+          state = 2;
+          out = e;
+        }
+      };
+      // runs as the native reaction: the result is final now, so record it
+      // and drop the lazy link (which holds the parent) — a queue built as
+      // `q = q.then(task)` must not keep every earlier step reachable
+      const result = (): any => {
+        derived._lazy = undefined;
+        if (state === 2) {
+          derived._syncRejected = true;
+          derived._syncError = out;
+          throw out;
+        }
+        if (!(out && typeof out.then === "function")) {
+          derived._syncResolved = true;
+          derived._syncValue = out;
+        }
+        return out;
+      };
+      const derived: SyncPromise<any> = super.then(
+        (v) => {
+          settle(true, v);
+          return result();
+        },
+        (e) => {
+          settle(false, e);
+          return result();
+        },
+      ) as SyncPromise<any>;
+      const parent = this;
+      derived._lazy = () => {
+        parent._force();
+        if (parent._syncResolved) settle(true, parent._syncValue);
+        else if (parent._syncRejected) settle(false, parent._syncError);
+        else return;
+        if (state === 2) {
+          derived._syncRejected = true;
+          derived._syncError = out;
+          return;
+        }
+        if (out && typeof out.then === "function") {
+          let ok = false;
+          let bad = false;
+          let v: any;
+          out.then(
+            (x: any) => {
+              ok = true;
+              v = x;
+            },
+            (e: any) => {
+              bad = true;
+              v = e;
+            },
+          );
+          if (ok) {
+            derived._syncResolved = true;
+            derived._syncValue = v;
+          } else if (bad) {
+            derived._syncRejected = true;
+            derived._syncError = v;
+          }
+          return;
+        }
+        derived._syncResolved = true;
+        derived._syncValue = out;
+      };
+      return derived;
     }
 
     then<TResult1 = T, TResult2 = never>(
       onFulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
       onRejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
     ): Promise<TResult1 | TResult2> {
-      if (this._syncResolved && onFulfilled) {
+      // Native reactions are guarded at their intrinsic prototype. Only the
+      // synchronous unwrap path bypasses that boundary and needs its own guard.
+      if (syncScopeDepth() > 0) {
+        if (typeof onFulfilled === "function") onFulfilled = guardExitCallback(onFulfilled) as typeof onFulfilled;
+        onRejected = guardExitRejection(onRejected) as typeof onRejected;
+      }
+      // Sync fast-path ONLY inside an explicit sync scope (syncAwait above):
+      // it exists so require() machinery can unwrap synchronously. Everywhere
+      // else, fall through to native microtask timing so user-visible .then
+      // ordering matches Node (sync statements, then nextTick, then promises).
+      if (syncScopeDepth() > 0) this._force();
+      if (syncScopeDepth() > 0 && this._syncResolved && onFulfilled) {
         try {
           const result = onFulfilled(this._syncValue as T);
           if (
@@ -781,7 +1465,15 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && onRejected) {
+      if (this._syncRejected && syncScopeDepth() > 0) {
+        // consumed synchronously: the native promise must not also report
+        // an unhandled rejection
+        markHandled(this);
+        if (!onRejected) {
+          return new SyncPromise<TResult2>((_, rej) =>
+            rej(this._syncError),
+          ) as any;
+        }
         try {
           const result = onRejected(this._syncError);
           return new SyncPromise<TResult2>((res) =>
@@ -791,10 +1483,8 @@ function createSyncPromise(): typeof Promise {
           return new SyncPromise<TResult2>((_, rej) => rej(e)) as any;
         }
       }
-      if (this._syncRejected && !onRejected) {
-        return new SyncPromise<TResult2>((_, rej) =>
-          rej(this._syncError),
-        ) as any;
+      if (this._lazy || this._syncResolved || this._syncRejected) {
+        return this._lazyThen(onFulfilled, onRejected);
       }
       return super.then(onFulfilled, onRejected);
     }
@@ -819,9 +1509,25 @@ function createSyncPromise(): typeof Promise {
   (SyncPromise as any).reject = (reason: any) =>
     new SyncPromise((_, rej) => rej(reason));
 
+  // Inside a sync scope, lazy .then() results are forced so a combinator over
+  // promises built earlier can still settle synchronously.
+  const collect = (iterable: Iterable<any>): any[] => {
+    const arr = Array.from(iterable);
+    if (syncScopeDepth() > 0) {
+      for (const v of arr) if (isSyncPromise(v)) v._force();
+    }
+    return arr;
+  };
+  // A sync result stands in for the native combinator, which would have
+  // attached a handler to every input: do the same so a rejected input
+  // doesn't also surface as an unhandled rejection.
+  const consumed = (arr: any[]): void => {
+    for (const v of arr) if (v instanceof NativePromise) markHandled(v);
+  };
+
   // all/race/allSettled/any return SyncPromise so __syncAwait can unwrap them
   (SyncPromise as any).all = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     const results: any[] = new Array(arr.length);
     let allSync = true;
     for (let i = 0; i < arr.length; i++) {
@@ -830,6 +1536,7 @@ function createSyncPromise(): typeof Promise {
         if ((v as any)._syncResolved) {
           results[i] = (v as any)._syncValue;
         } else if ((v as any)._syncRejected) {
+          consumed(arr);
           return new SyncPromise((_, rej) => rej((v as any)._syncError));
         } else {
           allSync = false;
@@ -861,7 +1568,7 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).allSettled = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     const results: any[] = new Array(arr.length);
     let allSync = true;
     for (let i = 0; i < arr.length; i++) {
@@ -883,6 +1590,7 @@ function createSyncPromise(): typeof Promise {
       }
     }
     if (allSync) {
+      consumed(arr);
       return new SyncPromise((res: any) => res(results));
     }
     return new SyncPromise((res: any, rej: any) => {
@@ -891,18 +1599,21 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).race = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     for (const v of arr) {
       if (v instanceof SyncPromise) {
         if ((v as any)._syncResolved) {
+          consumed(arr);
           return new SyncPromise((res: any) => res((v as any)._syncValue));
         }
         if ((v as any)._syncRejected) {
+          consumed(arr);
           return new SyncPromise((_, rej: any) => rej((v as any)._syncError));
         }
       } else if (
         !(v && typeof v === "object" && typeof v.then === "function")
       ) {
+        consumed(arr);
         return new SyncPromise((res: any) => res(v));
       }
     }
@@ -912,12 +1623,14 @@ function createSyncPromise(): typeof Promise {
   };
 
   (SyncPromise as any).any = (iterable: Iterable<any>) => {
-    const arr = Array.from(iterable);
+    const arr = collect(iterable);
     for (const v of arr) {
       if (v instanceof SyncPromise && (v as any)._syncResolved) {
+        consumed(arr);
         return new SyncPromise((res: any) => res((v as any)._syncValue));
       }
       if (!(v && typeof v === "object" && typeof v.then === "function")) {
+        consumed(arr);
         return new SyncPromise((res: any) => res(v));
       }
     }
@@ -932,6 +1645,7 @@ function createSyncPromise(): typeof Promise {
       }
     }
     if (allSyncRejected && arr.length > 0) {
+      consumed(arr);
       return new SyncPromise((_, rej: any) =>
         rej(new AggregateError(errors, "All promises were rejected")),
       );
@@ -945,6 +1659,7 @@ function createSyncPromise(): typeof Promise {
 }
 
 const SyncPromiseClass = createSyncPromise();
+setSyncPromiseClass(SyncPromiseClass);
 
 function toImportNamespace(loaded: unknown): Record<string, unknown> {
   if (loaded == null || (typeof loaded !== "object" && typeof loaded !== "function")) {
@@ -980,28 +1695,78 @@ function toImportNamespace(loaded: unknown): Record<string, unknown> {
   return ns;
 }
 
-function makeDynamicLoader(
-  resolver: ResolverFn,
-): (specifier: string) => SyncThenable<unknown> | Promise<unknown> {
-  return (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+type DynamicLoader = ((specifier: unknown) => SyncThenable<unknown> | Promise<unknown>) & {
+  /** Module-scoped `Function` whose bodies route import() through this loader. */
+  Function: FunctionConstructor;
+};
+
+function makeDynamicLoader(resolver: ResolverFn): DynamicLoader {
+  const load = (specifier: unknown): SyncThenable<unknown> | Promise<unknown> => {
+    let id: string;
     try {
-      const loaded = resolver(specifier);
-      return new SyncThenable(toImportNamespace(loaded));
+      // import() uses ToString, unlike require(), which requires a string.
+      // Template coercion also rejects Symbols as the native operator does.
+      id = `${specifier}`;
+    } catch (err) {
+      return new SyncPromiseClass((_resolve, reject) => reject(err));
+    }
+    try {
+      return loadNow(id);
     } catch (err) {
       if (!(err instanceof AsyncModuleInitializationRequired)) throw err;
 
       // Dynamic imports can happen from async callbacks after the entry module
       // has already returned. Await and retry at this boundary so those late
       // imports cannot receive an uninitialized synchronous polyfill.
-      return err.ready.then(() => {
-        const loaded = resolver(specifier);
-        return toImportNamespace(loaded);
-      });
+      return err.ready.then(() => loadNow(id));
     }
   };
+  const loadNow = (specifier: string): SyncThenable<unknown> | Promise<unknown> => {
+    // inside a synchronous unwrap (a module de-asynced for top-level await)
+    // the import has to settle on the spot, so it loads the synchronous way
+    if (resolver.importDynamic && syncScopeDepth() === 0) {
+      const { record, exports, pending } = resolver.importDynamic(specifier);
+      if (pending) return pending.then(() => toImportNamespace(record!.exports));
+      return new SyncThenable(toImportNamespace(exports));
+    }
+    return new SyncThenable(toImportNamespace(resolver(specifier)));
+  };
+  return Object.assign(load, { Function: makeScopedFunction(load) });
+}
+
+const NativeFunction = Function;
+
+// `new Function("m", "return import(m)")` is how CommonJS builds keep an
+// ESM-only dependency loadable (@preact/preset-vite, import-meta-resolve,
+// ...): the body is assembled at runtime, so the AST rewrite of import() ->
+// __asyncLoad() never sees it and the worker's native import() receives a
+// bare specifier it cannot resolve ("Failed to resolve module specifier").
+// Each module gets a Function whose bodies get the same rewrite, with
+// __asyncLoad bound to that module's resolver. Bodies without import() go
+// to the native constructor untouched.
+function makeScopedFunction(asyncLoad: (specifier: string) => unknown): FunctionConstructor {
+  const Scoped = function Function(this: unknown, ...args: unknown[]): unknown {
+    const body = args.length ? String(args[args.length - 1]) : "";
+    if (!/\bimport\s*\(/.test(body)) return NativeFunction(...(args as string[]));
+    const params = args.slice(0, -1).map(String);
+    const inner = NativeFunction("__asyncLoad", ...params, rewriteDynamicImportsRegex(body));
+    const wrapped = function (this: unknown, ...callArgs: unknown[]) {
+      return inner.call(this, asyncLoad, ...callArgs);
+    };
+    Object.defineProperty(wrapped, "length", { value: Math.max(0, inner.length - 1) });
+    Object.defineProperty(wrapped, "toString", { value: () => inner.toString() });
+    return wrapped;
+  };
+  Scoped.prototype = NativeFunction.prototype;
+  return Scoped as unknown as FunctionConstructor;
 }
 
 // ── Types ──
+export interface RunFileOptions {
+  /** Directory relative specifiers resolve from (default: dirname(filename)). */
+  resolveDir?: string;
+}
+
 export interface ModuleRecord {
   id: string;
   filename: string;
@@ -1040,6 +1805,23 @@ export interface ResolverFn {
   extensions: Record<string, unknown>;
   main: ModuleRecord | null;
   _ownerRecord?: ModuleRecord;
+  /**
+   * Loads a module's static imports. Returns a promise when one of them
+   * evaluates asynchronously (top-level await), which the module's body must
+   * wait for; null otherwise.
+   */
+  preloadImports: (specifiers: string[]) => Promise<void> | null;
+  /**
+   * A static import from a module whose body can wait: throws ImportPending
+   * for a module still evaluating. Absent where imports load like require().
+   */
+  esm?: (id: string) => unknown;
+  /**
+   * import(): loads `id` like a static import, so top-level await in its
+   * graph runs natively. `pending` is set while it is still evaluating.
+   * Absent where imports can't wait (modules de-asynced for top-level await).
+   */
+  importDynamic?: (id: string) => { record: ModuleRecord | null; exports: unknown; pending: Promise<void> | null };
 }
 
 /** Build the Node-compatible import.meta object for a module under `resolver`. */
@@ -1094,7 +1876,7 @@ const CORE_MODULES: Record<string, unknown> = {
     },
     getOwnPropertyDescriptor(_t, prop) {
       if (!_shellExecPolyfill?.promises) return undefined;
-      return Object.getOwnPropertyDescriptor(_shellExecPolyfill.promises, prop);
+      return forwardedDescriptor(_shellExecPolyfill.promises, prop);
     },
     has(_t, prop) {
       if (!_shellExecPolyfill?.promises) return false;
@@ -1324,6 +2106,9 @@ function wrapConsole(
 }
 
 // ── Module resolver & loader ──
+// each engine's own fs.readFileSync, to tell when user code has replaced it
+const ownReadFileSync = new WeakMap<FsBridge, FsBridge["readFileSync"]>();
+
 function buildResolver(
   vol: MemoryVolume,
   fsBridge: FsBridge,
@@ -1333,6 +2118,8 @@ function buildResolver(
   opts: EngineOptions,
   codeCache?: Map<string, string>,
   deAsyncImports = false,
+  // static imports can wait for a module evaluating asynchronously (see esm)
+  asyncImports = false,
 ): ResolverFn {
   // Shared across all resolvers — avoids re-resolving the same paths/manifests per module
   // Use bounded LRU when a memory handler is available, else plain Map
@@ -1353,19 +2140,106 @@ function buildResolver(
   // Shared across all resolvers — deduplicates same-version packages from nested node_modules
   const _pkgIdentityMap: Record<string, string> =
     (cache as any).__pkgIdentityMap ?? ((cache as any).__pkgIdentityMap = {});
+  // package dir -> name@version of each dependency / peer it resolves
+  const _pkgDepViews: Map<string, string> =
+    (cache as any).__pkgDepViews ?? ((cache as any).__pkgDepViews = new Map());
+
+  // paths without a (readable) package.json, apart from the parsed manifests:
+  // resolution probes far more directories without one than packages exist,
+  // and in one LRU the misses kept evicting (and re-parsing) real manifests
+  const missingManifests: Map<string, null> =
+    (cache as any).__missingManifestCache ??
+    ((cache as any).__missingManifestCache = opts.handler
+      ? new _LRUCache<string, null>(opts.handler.options.resolveCacheSize)
+      : new Map());
 
   const readManifest = (manifestPath: string): PackageManifest | null => {
-    if (manifestCache.has(manifestPath))
-      return manifestCache.get(manifestPath)!;
+    const cachedManifest = manifestCache.get(manifestPath);
+    if (cachedManifest) return cachedManifest;
+    if (missingManifests.has(manifestPath)) return null;
+    // most lookups probe directories without a package.json; skip the ENOENT
+    if (!vol.existsSync(manifestPath)) {
+      missingManifests.set(manifestPath, null);
+      return null;
+    }
     try {
       const raw = vol.readFileSync(manifestPath, "utf8");
       const parsed = JSON.parse(raw) as PackageManifest;
       manifestCache.set(manifestPath, parsed);
       return parsed;
     } catch {
-      manifestCache.set(manifestPath, null);
+      missingManifests.set(manifestPath, null);
       return null;
     }
+  };
+
+  // Node reads module source through fs.readFileSync, and tools patch it to
+  // rewrite what require() evaluates (vue-tsc's runTsc adds .vue support to
+  // typescript/lib/tsc.js that way): use a replaced one, else the volume
+  const readModuleSource = (p: string): string => {
+    if (fsBridge.readFileSync === ownReadFileSync.get(fsBridge)) {
+      return vol.readFileSync(p, "utf8");
+    }
+    return String(fsBridge.readFileSync(p, "utf8"));
+  };
+
+  // Which versions a package's dependencies and peers resolve to from its
+  // directory. Two installed copies of one name@version are only the same
+  // module when they also see the same dependencies: @napi-rs/wasm-runtime
+  // nested under rolldown's wasm binding peers on @emnapi/core 2.x, the copy
+  // nested under satteri's on 1.x, and sharing one instance hands satteri's
+  // wasm the wrong emnapi imports. Only computed when two copies meet.
+  const depViewOf = (pkgDir: string, manifest: PackageManifest): string => {
+    let view = _pkgDepViews.get(pkgDir);
+    if (view !== undefined) return view;
+    const names = new Set([
+      ...Object.keys(manifest.dependencies || {}),
+      ...Object.keys(manifest.peerDependencies || {}),
+      ...Object.keys(manifest.optionalDependencies || {}),
+    ]);
+    const parts: string[] = [];
+    for (const name of names) {
+      let version = "";
+      for (let dir = pkgDir; ; dir = pathPolyfill.dirname(dir)) {
+        if (!dir.endsWith("/node_modules")) {
+          const dep = readManifest(
+            (dir === "/" ? "" : dir) + "/node_modules/" + name + "/package.json",
+          );
+          if (dep) {
+            version = dep.version || "0.0.0";
+            break;
+          }
+        }
+        if (dir === "/" || dir === "" || dir === ".") break;
+      }
+      parts.push(name + "@" + version);
+    }
+    view = parts.join(",");
+    _pkgDepViews.set(pkgDir, view);
+    return view;
+  };
+
+  // statSync(p).isFile() / isDirectory() without building a stat object
+  const kindOf = (p: string): "file" | "directory" | null => {
+    if (typeof vol.kindSync === "function") return vol.kindSync(p);
+    if (!vol.existsSync(p)) return null;
+    return vol.statSync(p).isFile() ? "file" : "directory";
+  };
+
+  // dir -> whether the nearest package.json declares "type": "module"
+  const typeModuleCache: Map<string, boolean> =
+    (cache as any).__typeModuleCache ??
+    ((cache as any).__typeModuleCache = new Map());
+  const isTypeModuleDir = (dir: string): boolean => {
+    const cached = typeModuleCache.get(dir);
+    if (cached !== undefined) return cached;
+    const mf = readManifest(dir === "/" ? "/package.json" : dir + "/package.json");
+    let result: boolean;
+    if (mf) result = mf.type === "module";
+    else if (dir === "/" || dir === "") result = false;
+    else result = isTypeModuleDir(pathPolyfill.dirname(dir));
+    typeModuleCache.set(dir, result);
+    return result;
   };
 
   const resolveId = (
@@ -1380,23 +2254,19 @@ function buildResolver(
     }
     if (id.startsWith("node:")) id = id.slice(5);
 
-    if (id.startsWith("file:///")) {
-      id = decodeURIComponent(id.slice(7));
-      if (/^[A-Za-z]:[\\/]/.test(id)) {
-        id = "/" + id.slice(2).replace(/\\/g, "/");
+    if (/^file:/i.test(id)) {
+      // path.join can collapse file:/// to file:/. Both are valid file URLs.
+      // Parse before decoding so encoded '?' and '#' remain filename bytes.
+      id = urlPolyfill.fileURLToPath(id);
+      if (/^\/?[A-Za-z]:[\\/]/.test(id)) {
+        id = "/" + id.replace(/^\/?[A-Za-z]:[\\/]/, "").replace(/\\/g, "/");
       }
-    } else if (id.startsWith("file://")) {
-      id = decodeURIComponent(id.slice(7));
-      if (/^[A-Za-z]:[\\/]/.test(id)) {
-        id = "/" + id.slice(2).replace(/\\/g, "/");
-      }
+    } else {
+      const qIdx = id.indexOf("?");
+      if (qIdx !== -1) id = id.slice(0, qIdx);
+      const hashIdx = id.indexOf("#");
+      if (hashIdx !== -1 && !id.startsWith("#")) id = id.slice(0, hashIdx);
     }
-
-    const qIdx = id.indexOf("?");
-    if (qIdx !== -1) id = id.slice(0, qIdx);
-
-    const hashIdx = id.indexOf("#");
-    if (hashIdx !== -1 && !id.startsWith("#")) id = id.slice(0, hashIdx);
 
     if (id.includes("\\")) id = id.replace(/\\/g, "/");
 
@@ -1480,16 +2350,13 @@ function buildResolver(
     }
 
     const tryFile = (base: string): string | null => {
-      if (vol.existsSync(base)) {
-        const s = vol.statSync(base);
-        if (s.isFile()) return base;
+      const kind = kindOf(base);
+      if (kind !== null) {
+        if (kind === "file") return base;
         const localMf = readManifest(pathPolyfill.join(base, "package.json"));
         if (localMf?.main) {
           const mainPath = pathPolyfill.join(base, localMf.main);
-          if (vol.existsSync(mainPath)) {
-            const ms = vol.statSync(mainPath);
-            if (ms.isFile()) return mainPath;
-          }
+          if (kindOf(mainPath) === "file") return mainPath;
           for (const ext of MAIN_FIELD_EXTENSIONS) {
             const withExt = mainPath + ext;
             if (vol.existsSync(withExt)) return withExt;
@@ -1500,7 +2367,7 @@ function buildResolver(
           if (vol.existsSync(idxPath)) return idxPath;
         }
       }
-      for (const ext of [...MAIN_FIELD_EXTENSIONS, ".node"]) {
+      for (const ext of FILE_EXTENSIONS_WITH_NODE) {
         const withExt = base + ext;
         if (vol.existsSync(withExt)) return withExt;
       }
@@ -1544,6 +2411,9 @@ function buildResolver(
     };
 
     const tryNodeModules = (nmDir: string, moduleId: string): string | null => {
+      // nothing resolves under a node_modules that isn't there: skip the
+      // manifest and ~10 extension probes for each ancestor without one
+      if (!vol.existsSync(nmDir)) return null;
       const parts = moduleId.split("/");
       const pkgName =
         parts[0].startsWith("@") && parts.length > 1
@@ -1616,7 +2486,13 @@ function buildResolver(
                 if (found) {
                   if (found.endsWith(".cjs")) {
                     try {
-                      const content = vol.readFileSync(found, "utf8");
+                      // a stub that only throws: its first statement is
+                      // enough, no need to decode the whole file
+                      const bytes = vol.readFileSync(found);
+                      let content = new TextDecoder().decode(bytes.subarray(0, 512));
+                      if (content.trim() === "" && bytes.length > 512) {
+                        content = vol.readFileSync(found, "utf8");
+                      }
                       if (content.trimStart().startsWith("throw ")) continue;
                     } catch {
                       /* proceed */
@@ -1673,7 +2549,9 @@ function buildResolver(
 
     // Fallback: resolve from cwd (handles modules loaded from temp/bundled locations)
     const cwd = proc.cwd();
-    if (cwd !== fromDir && cwd !== "/") {
+    // (a cwd at or above fromDir: the walk above already probed every
+    // directory this one would)
+    if (cwd !== fromDir && cwd !== "/" && !fromDir.startsWith(cwd + "/")) {
       let fallbackDir = cwd;
       while (fallbackDir !== "/" && fallbackDir !== fromDir) {
         const nmDir = pathPolyfill.join(fallbackDir, "node_modules");
@@ -1694,15 +2572,22 @@ function buildResolver(
     throw e;
   };
 
+  // `viaImport`: loaded for a static import or import() whose importer can
+  // wait, so top-level await in it runs natively (see preloadImports)
   const loadModule = (
     resolved: string,
     parentRecord?: ModuleRecord,
+    viaImport = false,
   ): ModuleRecord => {
     if (cache[resolved]) return cache[resolved];
 
     // Package dedup: reuse first instance of name@version:path to prevent
     // "Cannot use X from another module or realm" errors
     const nmIdx = resolved.lastIndexOf("/node_modules/");
+    // installed package this module belongs to: its transforms are shared
+    // with other processes through the main thread's transform store
+    let sharedScope: string | null = null;
+    let sharedRel = "";
     if (nmIdx !== -1) {
       const afterNm = resolved.slice(nmIdx + "/node_modules/".length);
       const parts = afterNm.split("/");
@@ -1710,25 +2595,33 @@ function buildResolver(
         ? parts[0] + "/" + parts[1]
         : parts[0];
       const pkgDir = resolved.slice(0, nmIdx) + "/node_modules/" + pkgName;
-      try {
-        const pkgJson = JSON.parse(
-          vol.readFileSync(pkgDir + "/package.json", "utf8"),
-        );
+      const pkgJson = readManifest(pkgDir + "/package.json");
+      if (pkgJson) {
+        sharedScope = `${transformSalt()}|${pkgName}@${pkgJson.version || "0.0.0"}`;
+        sharedRel = afterNm.slice(pkgName.length + 1);
         // Include file path so different subpath exports (svelte vs svelte/compiler) aren't deduped
-        const identity =
+        let identity =
           pkgName + "@" + (pkgJson.version || "0.0.0") + ":" + afterNm;
-        if (!_pkgIdentityMap[identity]) {
+        let canonical = _pkgIdentityMap[identity];
+        if (canonical && canonical !== resolved) {
+          // (both paths end in afterNm, which starts with the package name)
+          const canonicalPkgDir = canonical.slice(0, canonical.length - afterNm.length) + pkgName;
+          const view = depViewOf(pkgDir, pkgJson);
+          if (view !== depViewOf(canonicalPkgDir, pkgJson)) {
+            // a copy seeing other dependencies: shared only with its likes
+            identity += "|" + view;
+            canonical = _pkgIdentityMap[identity];
+          }
+        }
+        if (!canonical) {
           _pkgIdentityMap[identity] = resolved;
-        } else if (_pkgIdentityMap[identity] !== resolved) {
+        } else if (canonical !== resolved) {
           // Only reuse fully-loaded modules — returning mid-execution ones causes "X is not a function"
-          const canonical = _pkgIdentityMap[identity];
           if (cache[canonical] && cache[canonical].loaded) {
             cache[resolved] = cache[canonical];
             return cache[canonical];
           }
         }
-      } catch {
-        /* no package.json */
       }
     }
 
@@ -1750,7 +2643,7 @@ function buildResolver(
     try { opts.onModuleLoad?.(resolved); } catch { /* observer must not affect module loading */ }
 
     if (resolved.endsWith(".json")) {
-      const raw = vol.readFileSync(resolved, "utf8");
+      const raw = readModuleSource(resolved);
       record.exports = JSON.parse(raw);
       record.loaded = true;
       return record;
@@ -1774,23 +2667,50 @@ function buildResolver(
       return record;
     }
 
-    const rawSource = vol.readFileSync(resolved, "utf8");
+    const rawSource = readModuleSource(resolved);
     const dir = pathPolyfill.dirname(resolved);
     const moduleExportName = pickModuleExportName(rawSource);
 
-    const codeCacheKey = `${resolved}|${quickDigest(rawSource)}`;
-    let processedCode = codeCache?.get(codeCacheKey);
-    let moduleHasTLA = codeCache?.get(`${codeCacheKey}|tla`) === "1";
+    const sourceDigest = contentDigest(rawSource);
+    const codeCacheKey = `${resolved}|${sourceDigest}`;
+    // one cache entry per module: its flags, then its code (see
+    // encodeCachedTransform), so the flags can't be evicted apart from it
+    let processedCode: string | undefined;
+    let moduleHasTLA = false;
+    // output of the lexer fast path is re-derived through the full AST path
+    // if V8 rejects it (see the eval below)
+    let usedFastPath = false;
+    // whether moduleHasTLA is known (cached or computed with the transform)
+    let tlaKnown = false;
+    const cachedTransform = codeCache?.get(codeCacheKey);
+    if (cachedTransform !== undefined) {
+      const flags = cachedTransform.charCodeAt(0) - CACHED_FLAGS_BASE;
+      if (flags >= 0 && flags < 8) {
+        moduleHasTLA = (flags & 1) !== 0;
+        usedFastPath = (flags & 2) !== 0;
+        processedCode = (flags & FLAG_SAME_AS_SOURCE) !== 0 ? rawSource : cachedTransform.slice(1);
+        tlaKnown = true;
+      }
+    }
 
-    if (!processedCode) {
+    const transformSource = (allowFast: boolean): void => {
       processedCode = rawSource;
+      usedFastPath = false;
       if (processedCode.startsWith("#!")) {
         processedCode = processedCode.slice(processedCode.indexOf("\n") + 1);
       }
       if (isTypeScriptFile(resolved)) {
         processedCode = stripTypeScript(processedCode, resolved);
       }
-      if (resolved.endsWith(".cjs")) {
+      const fast =
+        allowFast && !deAsyncImports
+          ? fastCommonJsTransform(processedCode, resolved, isTypeModuleDir)
+          : null;
+      if (fast !== null) {
+        processedCode = fast;
+        moduleHasTLA = false;
+        usedFastPath = true;
+      } else if (resolved.endsWith(".cjs")) {
         // CJS: only rewrite import()/import.meta via AST, skip full ESM conversion
         try {
           const cjsAst = acorn.parse(processedCode, {
@@ -1824,15 +2744,7 @@ function buildResolver(
             }
           };
           walkCjs(cjsAst);
-          if (cjsPatches.length > 0) {
-            cjsPatches.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-            for (const [start, end, replacement] of cjsPatches) {
-              processedCode =
-                processedCode.slice(0, start) +
-                replacement +
-                processedCode.slice(end);
-            }
-          }
+          processedCode = applyPatches(processedCode!, cjsPatches);
         } catch {
           /* can't parse — leave untransformed */
         }
@@ -1845,75 +2757,172 @@ function buildResolver(
         processedCode = converted.code;
         moduleHasTLA = converted.hasTLA;
       }
-      codeCache?.set(codeCacheKey, processedCode);
-      codeCache?.set(`${codeCacheKey}|tla`, moduleHasTLA ? "1" : "0");
+      if (codeCache) {
+        codeCache.set(
+          codeCacheKey,
+          encodeCachedTransform(processedCode === rawSource ? null : processedCode!, moduleHasTLA, usedFastPath),
+        );
+        tlaKnown = true;
+      }
+    };
+
+    const sharedTransforms = sharedScope ? getSharedTransformClient() : null;
+    const sharedKey = sharedTransforms
+      ? `${sharedRel}|${rawSource.length}|${sourceDigest}`
+      : "";
+    if (processedCode === undefined && sharedTransforms) {
+      const hit = takeSharedTransform(sharedTransforms, sharedScope!, sharedKey);
+      if (hit) {
+        const same = (hit[1] & FLAG_SAME_AS_SOURCE) !== 0;
+        processedCode = same ? rawSource : hit[0];
+        moduleHasTLA = (hit[1] & 1) !== 0;
+        usedFastPath = (hit[1] & 2) !== 0;
+        if (codeCache) {
+          // the shared store keeps the code; a local copy would only double
+          // what this process already holds (only the tiny "unchanged" mark)
+          if (same) codeCache.set(codeCacheKey, encodeCachedTransform(null, moduleHasTLA, usedFastPath));
+          tlaKnown = true;
+        }
+      }
+    }
+    const publishTransform = (): void => {
+      if (!sharedTransforms) return;
+      const same = processedCode === rawSource;
+      // a transform that baked this file's absolute location in (the regex
+      // fallback's import.meta values) only fits this path: keep it local
+      if (!same && processedCode!.includes(dir) && !rawSource.includes(dir)) return;
+      sharedTransforms.put(
+        sharedScope!,
+        sharedKey,
+        same ? "" : processedCode!,
+        (moduleHasTLA ? 1 : 0) | (usedFastPath ? 2 : 0) | (same ? FLAG_SAME_AS_SOURCE : 0),
+      );
+      // published: repeat loads get it from the shared store, the local cache
+      // needn't hold a second copy of the code
+      if (!same) codeCache?.delete(codeCacheKey);
+    };
+    if (processedCode === undefined) {
+      transformSource(true);
+      publishTransform();
     }
 
     const isCjs = resolved.endsWith(".cjs");
-    if (!isCjs && !codeCache?.has(`${codeCacheKey}|tla`)) {
-      moduleHasTLA = hasTopLevelAwait(processedCode);
-    }
-    const useFullDeAsync = deAsyncImports || moduleHasTLA;
-    if (!isCjs)
-      processedCode = stripTopLevelAwait(
-        processedCode,
-        deAsyncImports ? "full" : "topLevelOnly",
-      );
+    let useFullDeAsync = false;
+    // top-level await that runs natively, the module evaluating asynchronously
+    let asyncEval = false;
+    let childResolver!: ResolverFn;
+    const finishTransform = (): void => {
+      if (!isCjs && !tlaKnown) {
+        moduleHasTLA = hasTopLevelAwait(processedCode!);
+      }
+      asyncEval = viaImport && moduleHasTLA && !isCjs;
+      // required instead (require() can't wait), top-level await is unwrapped
+      // synchronously and so is everything this module imports
+      useFullDeAsync = deAsyncImports || (moduleHasTLA && !asyncEval);
+      // Without top-level await (and outside de-async mode) the strip is a
+      // no-op, so skip its full re-parse. A module with top-level await gets
+      // its own async functions de-asynced only for calls its awaits unwrap.
+      if (!isCjs && useFullDeAsync)
+        processedCode = stripTopLevelAwait(
+          processedCode!,
+          deAsyncImports ? "full" : "scoped",
+        );
 
-    const childResolver = buildResolver(
-      vol,
-      fsBridge,
-      proc,
-      dir,
-      cache,
-      opts,
-      codeCache,
-      useFullDeAsync,
-    );
-    childResolver.cache = cache;
-    childResolver._ownerRecord = record;
+      childResolver = buildResolver(
+        vol,
+        fsBridge,
+        proc,
+        dir,
+        cache,
+        opts,
+        codeCache,
+        useFullDeAsync,
+        viaImport && !useFullDeAsync,
+      );
+      childResolver.cache = cache;
+      childResolver._ownerRecord = record;
+    };
+    finishTransform();
 
     const wrappedConsole = wrapConsole(opts.onConsole);
 
     try {
-      const wrapper = buildModuleWrapper(processedCode, { moduleExportName });
+      let wrapper = buildModuleWrapper(processedCode!, { moduleExportName, async: asyncEval });
 
       let fn;
       try {
         fn = (0, eval)(wrapper);
       } catch (syntaxErr) {
-        const msg =
-          syntaxErr instanceof Error ? syntaxErr.message : String(syntaxErr);
-        throw new SyntaxError(`${msg} (in ${resolved})`);
-      }
-
-      {
-        const srcMap =
-          (globalThis as any).__dbgSrcMap ||
-          ((globalThis as any).__dbgSrcMap = new Map());
-        srcMap.set(resolved, wrapper);
+        if (usedFastPath && syntaxErr instanceof SyntaxError) {
+          // The lexer classified this as CommonJS but V8 disagrees (e.g.
+          // top-level await in a script-looking file). Re-derive it through
+          // the full AST transform.
+          transformSource(false);
+          publishTransform();
+          finishTransform();
+          wrapper = buildModuleWrapper(processedCode!, { moduleExportName, async: asyncEval });
+          try {
+            fn = (0, eval)(wrapper);
+          } catch (retryErr) {
+            const msg =
+              retryErr instanceof Error ? retryErr.message : String(retryErr);
+            throw new SyntaxError(`${msg} (in ${resolved})`);
+          }
+        } else {
+          const msg =
+            syntaxErr instanceof Error ? syntaxErr.message : String(syntaxErr);
+          throw new SyntaxError(`${msg} (in ${resolved})`);
+        }
       }
 
       const asyncLoader = makeDynamicLoader(childResolver);
-      fn(
-        record.exports,
-        childResolver,
-        record,
-        resolved,
-        dir,
-        proc,
-        wrappedConsole,
-        importMetaForModule(childResolver, resolved, dir),
-        asyncLoader,
-        syncAwait,
-        SyncPromiseClass,
+      const evaluate = (): unknown =>
+        fn(
+          record.exports,
+          childResolver,
+          record,
+          resolved,
+          dir,
+          proc,
+          wrappedConsole,
+          importMetaForModule(childResolver, resolved, dir),
+          asyncLoader,
+          syncAwait,
+          syncAwaitFn,
+          SyncPromiseClass,
+        );
+
+      // Imported where the importer can wait: an import of a module still
+      // evaluating asynchronously makes this one wait for it too (and so its
+      // importers, up to the entry or the import() that can wait)
+      const evaluating = runModuleBody(evaluate, asyncEval, () =>
+        childResolver.preloadImports(staticImportsOf(processedCode!, moduleExportName)),
       );
+      if (evaluating) {
+        const evaluation = evaluating.then(
+          () => {
+            pendingEvaluations.delete(record);
+            record.loaded = true;
+            patchFetchNodeAdapterExports(record.exports as Record<string, unknown>);
+            settleLiveImports(record);
+          },
+          (err) => {
+            pendingEvaluations.delete(record);
+            if (cache[resolved] === record) delete cache[resolved];
+            throw err;
+          },
+        );
+        pendingEvaluations.set(record, evaluation);
+        (globalThis as any).__loadModuleDepth = _loadDepth - 1;
+        return record;
+      }
 
       record.loaded = true;
       patchFetchNodeAdapterExports(
         record.exports as Record<string, unknown>,
       );
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
+      settleLiveImports(record);
     } catch (err) {
       (globalThis as any).__loadModuleDepth = _loadDepth - 1;
       delete cache[resolved];
@@ -1956,6 +2965,7 @@ function buildResolver(
             importMetaForModule(childResolver, resolved, dir),
             asyncLoader,
             syncAwait,
+            syncAwaitFn,
             SyncPromiseClass,
           );
           record.loaded = true;
@@ -1982,9 +2992,11 @@ function buildResolver(
     return record;
   };
 
-  // Typed as ResolverFn only after resolve/cache/extensions/main are attached
-  // below — defineProperty(main) is invisible to the checker at declaration.
-  const resolver = ((id: string): unknown => {
+  // require(id); `viaImport` loads it for an import that can wait on it
+  // (see loadModule). `resolver` below is typed as ResolverFn only after
+  // resolve/cache/extensions/main are attached — defineProperty(main) is
+  // invisible to the checker at declaration.
+  const requireFrom = (id: string, viaImport: boolean): unknown => {
     if (typeof id !== "string") {
       // Match real Node.js error: TypeError with ERR_INVALID_ARG_TYPE code
       const err: any = new TypeError(
@@ -2202,7 +3214,8 @@ function buildResolver(
 
     let rec: ModuleRecord;
     try {
-      rec = loadModule(resolved, resolver._ownerRecord);
+      rec = loadModule(resolved, resolver._ownerRecord, viaImport);
+      lastLoaded = rec;
     } catch (loadErr: any) {
       // When a bare module fails to load (e.g. native binding not found inside
       // the module), try a WASM drop-in replacement: {name}-wasm or {name}-wasm32-wasi
@@ -2275,12 +3288,40 @@ function buildResolver(
         },
         getOwnPropertyDescriptor(_t, prop) {
           if (!rec.exports) return undefined;
-          return Object.getOwnPropertyDescriptor(rec.exports as any, prop);
+          return forwardedDescriptor(rec.exports as any, prop);
         },
       });
     }
     return rec.exports;
-  }) as ResolverFn;
+  };
+  // the record requireFrom() last loaded a file module for (null for core
+  // modules and polyfills): how an import finds out it has to wait
+  let lastLoaded: ModuleRecord | null = null;
+  const importRecord = (id: string): { record: ModuleRecord | null; exports: unknown; pending: Promise<void> | null } => {
+    lastLoaded = null;
+    const exports = requireFrom(id, true);
+    const record = lastLoaded as ModuleRecord | null;
+    return { record, exports, pending: record ? pendingEvaluations.get(record) ?? null : null };
+  };
+
+  const resolver = ((id: string): unknown => requireFrom(id, false)) as ResolverFn;
+
+  resolver.preloadImports = (specifiers: string[]): Promise<void> | null => {
+    let waits: Promise<void>[] | null = null;
+    for (const id of specifiers) {
+      const { pending } = importRecord(id);
+      if (pending) (waits ??= []).push(pending);
+    }
+    return waits && Promise.all(waits).then(() => {});
+  };
+  if (!deAsyncImports) resolver.importDynamic = importRecord;
+  if (asyncImports) {
+    resolver.esm = (id: string): unknown => {
+      const { exports, pending } = importRecord(id);
+      if (pending) throw new ImportPending(pending);
+      return exports;
+    };
+  }
 
   resolver.resolve = (id: string, options?: { paths?: string[] }): string => {
     // CORE_MODULES also contains non-builtin package shims (for example
@@ -2299,6 +3340,25 @@ function buildResolver(
     }
     return resolveId(id, baseDir);
   };
+
+  // `__liveImport` in the wrapper (see ESMToCJSOptions.liveImports): an
+  // import of a module that is still loading re-reads its bindings once
+  // that module finishes
+  Object.defineProperty(resolver, "__liveImport", {
+    value: (id: string, update: (exports: unknown) => void): void => {
+      let resolved: string;
+      try {
+        resolved = resolver.resolve(id);
+      } catch {
+        return;
+      }
+      const rec = cache[resolved];
+      if (!rec || rec.loaded) return;
+      const pending = pendingLiveImports.get(rec);
+      if (pending) pending.push(update);
+      else pendingLiveImports.set(rec, [update]);
+    },
+  });
 
   resolver.cache = cache;
   resolver.extensions = {
@@ -2327,6 +3387,21 @@ function markResolverMain(resolver: ResolverFn, mod: ModuleRecord): void {
   if (resolver.main == null) resolver.main = mod;
 }
 
+// module still loading -> import binding updates of its circular importers
+const pendingLiveImports = new WeakMap<
+  ModuleRecord,
+  Array<(exports: unknown) => void>
+>();
+
+// run once `mod` has finished loading
+function settleLiveImports(mod: ModuleRecord): void {
+  const updates = pendingLiveImports.get(mod);
+  if (!updates) return;
+  pendingLiveImports.delete(mod);
+  if (mod.exports == null) return;
+  for (const update of updates) update(mod.exports);
+}
+
 // ── ScriptEngine class ──
 export class ScriptEngine {
   private vol: MemoryVolume;
@@ -2351,6 +3426,10 @@ export class ScriptEngine {
     // before any napi-rs / emnapi package loads: host MessagePort.ref must
     // keep the event loop alive (emnapi WaitingRequestCounter).
     threadPoolPolyfill.installHostMessagePortKeepAlive();
+    perfPolyfill.installHostPerformanceExtensions();
+    // Importing the browser SDK must not patch the application's promises.
+    // Install the boundary only in a realm that actually executes Node code.
+    installPromiseExitGuard(asyncCtxPolyfill.getNativePromiseConstructor());
     this.vol = vol;
     this.proc = buildProcessEnv({
       cwd: opts.cwd || "/",
@@ -2359,6 +3438,7 @@ export class ScriptEngine {
       onStderr: opts.onStderr,
     });
     this.fsBridge = buildFileSystemBridge(vol, () => this.proc.cwd());
+    ownReadFileSync.set(this.fsBridge, this.fsBridge.readFileSync);
     this.opts = opts;
 
     // Don't call initShellExec here — Nodepod.boot() sets up the shell with correct cwd
@@ -2406,8 +3486,8 @@ export class ScriptEngine {
 
     // Next.js createAsyncLocalStorage() prefers globalThis.AsyncLocalStorage over
     // require('async_hooks'). Install our propagation-aware polyfill so
-    // workUnitAsyncStorage / workAsyncStorage survive await boundaries.
-    asyncCtxPolyfill.installAsyncContext();
+    // workUnitAsyncStorage / workAsyncStorage survive await boundaries (the
+    // first storage constructed installs the context tracking).
     if (!(globalThis as any).AsyncLocalStorage?.__nodepodAsyncCtx) {
       (globalThis as any).AsyncLocalStorage = asyncCtxPolyfill.AsyncLocalStorage;
       ((globalThis as any).AsyncLocalStorage as any).__nodepodAsyncCtx = true;
@@ -2516,9 +3596,38 @@ export class ScriptEngine {
               }
             }
           }
+          // http://localhost:PORT/... from inside a pod: deliver to the
+          // virtual server on that port (this worker's or a sibling's), the
+          // way node's fetch reaches a local socket. falls through to the
+          // network when nothing listens there.
+          const local = url ? parseLoopbackHttpUrl(url) : null;
+          if (local) {
+            return fetchVirtualServer(input, init, local).then((resp) =>
+              resp ?? origFetch(input, init),
+            );
+          }
+          // cross-origin targets go through the configured CORS proxy (if
+          // any), like http.request does: pages like github.com's send no
+          // CORS headers, so a browser can't read them directly
+          const proxied = url ? proxyUrlForFetch(url) : null;
+          if (proxied) {
+            return origFetch(
+              input instanceof Request ? new Request(proxied, input) : proxied,
+              init,
+            );
+          }
           return origFetch(input, init);
         };
-        return doFetch().finally(() => handle.close());
+        return doFetch().then(
+          (resp) => {
+            handle.close();
+            return trackFetchBodyConsumption(resp);
+          },
+          (err) => {
+            handle.close();
+            throw err;
+          },
+        );
       };
       (globalThis as any).fetch = Object.assign(patchedFetch, {
         __nodepodPatched: true,
@@ -2526,9 +3635,12 @@ export class ScriptEngine {
     }
 
     // bundlers (rolldown, rollup, Vite) prefix virtual module paths with null bytes (\0module, %00module), but Chrome's URL constructor rejects those — sanitize while keeping the virtual semantics
+    // Chrome also reads `file:/abs` as host "abs": parse file: URLs like node
     if (!(globalThis.URL as any).__nodepodPatched) {
       const OrigURL = globalThis.URL;
       const PatchedURL = function URL(this: any, url: string, base?: string) {
+        url = urlPolyfill.toNodeFileUrl(url);
+        base = urlPolyfill.toNodeFileUrl(base);
         try {
           if (base !== undefined) return new OrigURL(url, base);
           return new OrigURL(url);
@@ -2564,9 +3676,18 @@ export class ScriptEngine {
         bytes: BufferSource,
       ) {
         const cached = getCachedModule(bytes);
-        if (cached) return cached;
+        if (cached) {
+          const clone = cloneCachedModule(cached);
+          if (clone) return clone;
+        }
         try {
-          return new OrigModule(bytes);
+          const compiled = new OrigModule(bytes);
+          registerCompiledModule(
+            new Uint8Array(bytes instanceof ArrayBuffer ? bytes : bytes.buffer,
+              bytes instanceof ArrayBuffer ? 0 : bytes.byteOffset, bytes.byteLength),
+            compiled,
+          );
+          return compiled;
         } catch (e: any) {
           if (
             e &&
@@ -2574,7 +3695,10 @@ export class ScriptEngine {
               e.message?.includes("buffer size is larger than"))
           ) {
             const cached2 = getCachedModule(bytes);
-            if (cached2) return cached2;
+            if (cached2) {
+              const clone = cloneCachedModule(cached2);
+              if (clone) return clone;
+            }
             const compilePromise = compileWasmInWorker(
               bytes instanceof ArrayBuffer
                 ? new Uint8Array(bytes)
@@ -2631,6 +3755,9 @@ export class ScriptEngine {
     class ExtendedDecoder {
       private enc: string;
       private inner: TextDecoder | null = null;
+      private utf8 = false;
+      // the inner decoder may hold a partial character from a stream call
+      private streaming = false;
 
       constructor(encoding: string = "utf-8", options?: TextDecoderOptions) {
         this.enc = encoding.toLowerCase();
@@ -2651,6 +3778,7 @@ export class ScriptEngine {
           } catch {
             this.inner = new Original("utf-8", options);
           }
+          this.utf8 = this.inner.encoding === "utf-8";
         }
       }
 
@@ -2675,12 +3803,21 @@ export class ScriptEngine {
       }
 
       decode(input?: BufferSource, options?: TextDecodeOptions): string {
+        const stream = !!options?.stream;
+        if (this.utf8 && !this.streaming && !stream && input instanceof Uint8Array) {
+          const short = decodeShortAscii(input);
+          if (short !== null) return short;
+        }
         if (!input) {
+          this.streaming = false;
           if (this.inner) return this.inner.decode(undefined, options);
           return "";
         }
         const safe = ExtendedDecoder.normalizeInput(input);
-        if (this.inner) return this.inner.decode(safe, options);
+        if (this.inner) {
+          this.streaming = stream;
+          return this.inner.decode(safe, options);
+        }
         const safeView = safe as ArrayBufferView | ArrayBuffer;
         const bytes =
           safeView instanceof ArrayBuffer
@@ -2996,10 +4133,12 @@ export class ScriptEngine {
         importMetaForModule(resolver, filename, dir),
         asyncLoader,
         syncAwait,
+        syncAwaitFn,
         SyncPromiseClass,
       );
 
       mod.loaded = true;
+      settleLiveImports(mod);
     } catch (err) {
       delete this.moduleRegistry[filename];
       throw err;
@@ -3025,11 +4164,17 @@ export class ScriptEngine {
   runFileSync = this.runFile;
 
   // Wraps in async IIFE when TLA is detected, falls back to sync otherwise
-  async runFileTLA(filename: string): Promise<{ exports: unknown; module: ModuleRecord }> {
+  //
+  // `resolveDir` overrides the directory used for relative require/import
+  // resolution, __dirname and import.meta (default: the file's directory).
+  async runFileTLA(
+    filename: string,
+    opts?: RunFileOptions,
+  ): Promise<{ exports: unknown; module: ModuleRecord }> {
     let retries = 0;
     while (true) {
       try {
-        return await this.runFileTLAOnce(filename);
+        return await this.runFileTLAOnce(filename, opts);
       } catch (err) {
         if (!(err instanceof AsyncModuleInitializationRequired) || retries++ >= 1) {
           throw err;
@@ -3044,9 +4189,12 @@ export class ScriptEngine {
 
   private async runFileTLAOnce(
     filename: string,
+    opts?: RunFileOptions,
   ): Promise<{ exports: unknown; module: ModuleRecord }> {
     const source = this.vol.readFileSync(filename, "utf8");
-    const dir = pathPolyfill.dirname(filename);
+    // `node -e` scripts live outside the project tree but must resolve
+    // relative specifiers from the cwd, exactly like node's [eval] module.
+    const dir = opts?.resolveDir ?? pathPolyfill.dirname(filename);
     // No need to write — source was just read from the same volume.
     // Writing it back triggers file watchers (nodemon restart loops).
 
@@ -3073,8 +4221,17 @@ export class ScriptEngine {
     const moduleExportName = pickModuleExportName(processed);
     let tla = false;
     if (filename.endsWith(".cjs")) {
-      processed = rewriteDynamicImportsRegex(processed);
-      processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
+      // Lexer positions skip string literals: the regex would also rewrite
+      // `new Function("m", "return import(m)")` (prettier's bin), leaving a
+      // body that calls an __asyncLoad the scoped Function never binds.
+      const lexed =
+        processed.length <= LEXER_MAX_CHARS ? lexModule(processed) : null;
+      if (lexed) {
+        processed = patchDynamicImports(processed, lexed);
+      } else {
+        processed = rewriteDynamicImportsRegex(processed);
+        processed = replaceImportMetaOutsideLiterals(processed, () => "import_meta");
+      }
     } else {
       const converted = convertModuleSyntaxDetailed(
         processed,
@@ -3087,7 +4244,8 @@ export class ScriptEngine {
     const tlaStripped = stripTopLevelAwait(processed);
 
     // Don't propagate deAsyncImports from entry — it uses native await (async IIFE),
-    // so deps don't need de-async. loadModule handles individual TLA modules.
+    // so deps don't need de-async, and its imports wait for modules with
+    // top-level await (asyncImports), which evaluate natively.
     const resolver = buildResolver(
       this.vol,
       this.fsBridge,
@@ -3097,59 +4255,43 @@ export class ScriptEngine {
       this.opts,
       this.transformCache,
       false,
+      true,
     );
     resolver._ownerRecord = mod;
     markResolverMain(resolver, mod);
 
-    if (!tla) {
-      try {
-        processed = tlaStripped;
-        const wrapper = buildModuleWrapper(processed, { moduleExportName });
-        const asyncLoader = makeDynamicLoader(resolver);
-        const fn = (0, eval)(wrapper);
-
-        fn(
-          mod.exports,
-          resolver,
-          mod,
-          filename,
-          dir,
-          this.proc,
-          consoleProxy,
-          importMetaForModule(resolver, filename, dir),
-          asyncLoader,
-          syncAwait,
-          SyncPromiseClass,
-        );
-        mod.loaded = true;
-      } catch (err) {
-        delete this.moduleRegistry[filename];
-        throw err;
-      }
-      return { exports: mod.exports, module: mod };
-    }
-
+    // an import of a module evaluating asynchronously (top-level await in
+    // its graph) is waited for, see runModuleBody
     try {
+      if (!tla) processed = tlaStripped;
       const wrapper = buildModuleWrapper(processed, {
-        async: true,
+        async: tla,
         moduleExportName,
       });
       const asyncLoader = makeDynamicLoader(resolver);
       const fn = (0, eval)(wrapper);
-      await fn(
-        mod.exports,
-        resolver,
-        mod,
-        filename,
-        dir,
-        this.proc,
-        consoleProxy,
-        importMetaForModule(resolver, filename, dir),
-        asyncLoader,
-        syncAwait,
-        SyncPromiseClass,
+      const evaluating = runModuleBody(
+        () =>
+          fn(
+            mod.exports,
+            resolver,
+            mod,
+            filename,
+            dir,
+            this.proc,
+            consoleProxy,
+            importMetaForModule(resolver, filename, dir),
+            asyncLoader,
+            syncAwait,
+            syncAwaitFn,
+            SyncPromiseClass,
+          ),
+        tla,
+        () => resolver.preloadImports(staticImportsOf(processed, moduleExportName)),
       );
+      if (evaluating) await evaluating;
       mod.loaded = true;
+      settleLiveImports(mod);
     } catch (err) {
       delete this.moduleRegistry[filename];
       throw err;
@@ -3168,6 +4310,7 @@ export class ScriptEngine {
     (this.moduleRegistry as any).__resolveCache?.clear();
     (this.moduleRegistry as any).__manifestCache?.clear();
     delete (this.moduleRegistry as any).__pkgIdentityMap;
+    delete (this.moduleRegistry as any).__pkgDepViews;
     delete (this.moduleRegistry as any).__mainModule;
     this.transformCache.clear();
   }

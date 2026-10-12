@@ -1,6 +1,6 @@
 # nodepod
 
-[![npm](https://img.shields.io/npm/v/@scelar/nodepod.svg)](https://www.npmjs.com/package/@scelar/nodepod)
+[![npm](https://img.shields.io/npm/v/@r1ck404/nodepod.svg)](https://www.npmjs.com/package/@r1ck404/nodepod)
 [![CI](https://github.com/R1ck404/Nodepod/actions/workflows/ci.yml/badge.svg)](https://github.com/R1ck404/Nodepod/actions/workflows/ci.yml)
 
 Run Node.js inside the browser. Nodepod provides a virtual filesystem, shell,
@@ -8,8 +8,12 @@ npm packages, worker-backed processes, and Node-compatible HTTP servers without
 requiring an application backend.
 
 ```bash
-npm install @scelar/nodepod
+npm install @r1ck404/nodepod
 ```
+
+> Nodepod used to be published as `@scelar/nodepod`. That name is deprecated;
+> switch to `@r1ck404/nodepod` (same API and subpaths:
+> `@r1ck404/nodepod/headless`, `/server`, `/vite`, `/next`).
 
 Nodepod is source-available under the MIT License with the Commons Clause. See
 [License](#license) before using it in a product.
@@ -17,7 +21,7 @@ Nodepod is source-available under the MIT License with the Commons Clause. See
 ## Quick start
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const nodepod = await Nodepod.boot({
   files: {
@@ -30,7 +34,7 @@ const process = await nodepod.spawn('node', ['hello.js']);
 process.on('output', (text) => console.log(text));
 await process.completion;
 
-nodepod.teardown();
+await nodepod.teardown();
 ```
 
 The browser entry enables Nodepod's preview service worker by default. If your
@@ -63,7 +67,7 @@ Vite can serve and emit Nodepod's runtime assets automatically:
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
-import nodepod from '@scelar/nodepod/vite';
+import nodepod from '@r1ck404/nodepod/vite';
 
 export default defineConfig({ plugins: [nodepod()] });
 ```
@@ -127,9 +131,10 @@ expectations.
 
 ## Sponsorship
 
-Sponsorship will be offered through GitHub Sponsors after the profile and public
-tiers are approved. Proposed details are documented on the
-[sponsor page](https://r1ck404.github.io/Nodepod/sponsors/). Sponsorship will not
+Nodepod is maintained independently. You can support it through
+[GitHub Sponsors](https://github.com/sponsors/R1ck404); tiers and listing details
+are documented on the
+[sponsor page](https://r1ck404.github.io/Nodepod/sponsors/). Sponsorship does not
 include an SLA, priority issue handling, private support, or early repository
 access.
 
@@ -137,9 +142,10 @@ No private email address is published for sponsor listings.
 
 ## Links
 
-- [npm package](https://www.npmjs.com/package/@scelar/nodepod)
+- [npm package](https://www.npmjs.com/package/@r1ck404/nodepod)
 - [GitHub repository](https://github.com/R1ck404/Nodepod)
 - [Contributing](./CONTRIBUTING.md)
+- [Sponsor on GitHub](https://github.com/sponsors/R1ck404)
 - [Sponsor policy](https://r1ck404.github.io/Nodepod/sponsors/)
 - [License](./LICENSE)
 

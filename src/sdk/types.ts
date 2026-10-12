@@ -2,6 +2,7 @@ import type { VolumeSnapshot } from "../engine-types";
 import type { MemoryHandlerOptions } from "../memory-handler";
 import type { ShellOptions } from "../shell/shell-options";
 import type { PreviewOriginOption } from "../request-proxy";
+import type { PersistenceOptions } from "../persistence/workspace/types";
 export type { ShellLimits, ShellOptions } from "../shell/shell-options";
 export type { PerformanceStats, PerformanceTiming } from "../performance-tracker";
 export type {
@@ -32,12 +33,18 @@ export interface NodepodOptions {
   /** Opt-in Nodepod subsystem profiling. Disabled by default. */
   profiler?: import("../profiling/types").ProfilerOptions;
   files?: Record<string, string | Uint8Array>;
+  /**
+   * Save the project filesystem and restore it on the next boot with the
+   * same `id`. node_modules is not saved; it is reinstalled from
+   * package.json (normally straight from the package cache).
+   */
+  persistence?: PersistenceOptions;
   env?: Record<string, string>;
   workdir?: string;
   /**
    * Headless mode: no terminal/preview UI required. Defaults `serviceWorker`
    * and `watermark` to false (can still be overridden). Implied when importing
-   * from `@scelar/nodepod/headless`.
+   * from `@r1ck404/nodepod/headless`.
    */
   headless?: boolean;
   /** URL of the nodepod service worker. Defaults to `/__sw__.js`. */
@@ -63,6 +70,15 @@ export interface NodepodOptions {
    * use path URLs.
    */
   previewOrigin?: PreviewOriginOption;
+  /**
+   * Same-origin paths that belong to the host application and must never be
+   * served by a pod, even when a preview has claimed an enclosing path such
+   * as `/`. Use this for host documents embedded alongside previews (a
+   * runtime host page, its module URLs). Entries ending in `/` are prefixes;
+   * others match exactly. Requests issued by a document at a reserved path
+   * bypass pod routing as well.
+   */
+  reservedHostPaths?: string[];
   /**
    * Visually rewrite loopback URLs in Nodepod-owned terminals to their real
    * preview URLs. Raw process stdout/stderr remain unchanged. Defaults to

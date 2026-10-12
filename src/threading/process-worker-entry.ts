@@ -4,30 +4,38 @@
 import { MemoryVolume } from "../memory-volume";
 import type { CompletedResponse } from "../polyfills/http";
 import {
+  installBodyReadLifetime,
   installFetchHeadersSetCookieParity,
   installNodeFetchClassParity,
 } from "../polyfills/fetch-response";
+import { installWasmWorkLifetime } from "../helpers/event-loop";
 import { ScriptEngine, setChildProcessPolyfill } from "../script-engine";
 import {
   setSqliteHostBridge,
   warmSqliteEngine,
-  warmSqliteWasmBytes,
   WASM_CACHE_PATH,
   WASM_SAB_HEADER_BYTES,
   WASM_SAB_MAX_BYTES,
 } from "../polyfills/sqlite";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import { applyFetchPolicy } from "../cross-origin";
 
 installFetchHeadersSetCookieParity();
 installNodeFetchClassParity();
+installBodyReadLifetime();
+// before the memory clamp (handleInit) wraps these, so its paths are held too
+installWasmWorkLifetime();
 import { SyncChannelWorker } from "./sync-channel";
-import { createLazyFsClient } from "./lazy-fs-client";
+import { createLazyFsClient, createSharedTransformClient } from "./lazy-fs-client";
+import { installWasmMemoryClamp } from "../helpers/wasm-memory-clamp";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
 import type {
   MainToWorkerMessage,
   MainToWorker_Init,
   MainToWorker_Exec,
   VFSSnapshotEntry,
   WorkerToMainMessage,
+  WorkerToMain_VFSBatch,
 } from "./worker-protocol";
 
 let _pid = 0;
@@ -50,6 +58,7 @@ let _ipcMessageHandler: ((data: unknown) => void) | null = null;
 // shell/child_process module has finished loading and installed its receiver.
 // Node buffers this traffic; preserve it here and replay after initialization.
 let _earlyIpcMessages: unknown[] = [];
+let _earlyIpcDisconnect = false;
 let _cols = 80;
 let _rows = 24;
 
@@ -58,6 +67,7 @@ const _childOutputCallbacks = new Map<number, (stream: string, data: string) => 
 const _childModuleCallbacks = new Map<number, (path: string) => void>();
 const _childExitCallbacks = new Map<number, (exitCode: number, stdout: string, stderr: string) => void>();
 const _ipcCallbacks = new Map<number, (data: unknown) => void>();
+const _ipcDisconnectCallbacks = new Map<number, () => void>();
 let _nextRequestId = 1;
 let _nextHttpClientId = 1;
 const MAX_CHILD_CAPTURE_CHARS = 4 * 1024 * 1024;
@@ -74,10 +84,10 @@ const SQLITE_SAB_OK = 1;
 const SQLITE_SAB_FAIL = 2;
 const SQLITE_LOAD_TIMEOUT_MS = 30_000;
 
-function installSqliteHostBridge(): void {
+function installSqliteHostBridge(): boolean {
   if (typeof SharedArrayBuffer === "undefined" || !_volume) {
     setSqliteHostBridge(null);
-    return;
+    return false;
   }
   setSqliteHostBridge({
     ensureWasmCached() {
@@ -115,6 +125,7 @@ function installSqliteHostBridge(): void {
       }
     },
   });
+  return true;
 }
 
 const _httpClientCallbacks = new Map<
@@ -126,9 +137,60 @@ const _httpClientCallbacks = new Map<
   }
 >();
 
+// vfs changes collected during a notification burst (declared before post(),
+// which reads them)
+type VfsOp = WorkerToMain_VFSBatch["ops"][number];
+let _vfsBurstDepth = 0;
+let _vfsBatch: VfsOp[] = [];
+let _vfsBatchTransfer: Transferable[] = [];
+
 function post(msg: WorkerToMainMessage, transfer?: Transferable[]): void {
-  (self as unknown as Worker).postMessage(msg, transfer ?? []);
+  // vfs changes batched so far go first: the main thread sees everything in
+  // the order it happened here
+  if (_vfsBatch.length > 0) flushVfsBatch();
+  (self as unknown as Worker).postMessage(attachWasmMessageMetadata(msg), transfer ?? []);
 }
+
+// vfs-write/vfs-delete ops collected during a notification burst (see
+// MemoryVolume.onNotificationBurst): one message for a moved package instead
+// of one per file
+function queueVfsOp(op: VfsOp, transfer?: ArrayBuffer): void {
+  if (_vfsBurstDepth === 0) {
+    if ("deleted" in op) post({ type: "vfs-delete", path: op.path });
+    else post({ type: "vfs-write", path: op.path, content: op.content, isDirectory: op.isDirectory }, transfer ? [transfer] : undefined);
+    return;
+  }
+  _vfsBatch.push(op);
+  if (transfer) _vfsBatchTransfer.push(transfer);
+}
+
+function flushVfsBatch(): void {
+  const ops = _vfsBatch;
+  const transfer = _vfsBatchTransfer;
+  _vfsBatch = [];
+  _vfsBatchTransfer = [];
+  if (ops.length === 0) return;
+  (self as unknown as Worker).postMessage({ type: "vfs-batch", ops } satisfies WorkerToMain_VFSBatch, transfer);
+}
+
+// esbuild-engine asks the main thread for the session's compiled esbuild
+// module instead of fetching and compiling its own copy. Once received it is
+// kept: a recycled esbuild instance (see esbuild-engine.ts) starts from it
+// again, and it stays alive anyway while this process runs esbuild.
+let _esbuildModule: WebAssembly.Module | null = null;
+let _esbuildModuleWaiters: Array<(mod: WebAssembly.Module | null) => void> | null = null;
+(globalThis as any).__nodepodRequestEsbuildModule = (): Promise<WebAssembly.Module | null> =>
+  new Promise((resolve) => {
+    if (_esbuildModule) {
+      resolve(_esbuildModule);
+      return;
+    }
+    if (!_esbuildModuleWaiters) {
+      _esbuildModuleWaiters = [];
+      post({ type: "esbuild-module-request" });
+    }
+    _esbuildModuleWaiters.push(resolve);
+  });
 
 function postStdout(data: string): void {
   post({ type: "stdout", data });
@@ -160,12 +222,19 @@ function postStdinRawStatus(isRaw: boolean): void {
 
 self.addEventListener("message", (ev: MessageEvent) => {
   if (!ev?.data?.type) return;
-  const msg = ev.data as MainToWorkerMessage;
+  const msg = receiveWasmMessageMetadata(ev.data) as MainToWorkerMessage;
 
   switch (msg.type) {
     case "probe":
       post({ type: "probe-ready" });
       break;
+    case "esbuild-module": {
+      if (msg.module) _esbuildModule = msg.module;
+      const waiters = _esbuildModuleWaiters ?? [];
+      _esbuildModuleWaiters = null;
+      for (const resolve of waiters) resolve(msg.module);
+      break;
+    }
     case "init":
       void handleInit(msg);
       break;
@@ -215,6 +284,9 @@ self.addEventListener("message", (ev: MessageEvent) => {
         }
       }
       break;
+    case "vfs-relist":
+      _volume?.relistLazy(msg.paths);
+      break;
     case "vfs-chunk":
       handleVFSChunk(msg);
       break;
@@ -254,6 +326,15 @@ self.addEventListener("message", (ev: MessageEvent) => {
       }
       break;
     }
+    case "ipc-disconnect": {
+      if (msg.targetRequestId !== undefined) {
+        _ipcCallbacks.delete(msg.targetRequestId);
+        _ipcDisconnectCallbacks.get(msg.targetRequestId)?.();
+        _ipcDisconnectCallbacks.delete(msg.targetRequestId);
+      } else if (_shellMod) _shellMod.handleIPCDisconnect();
+      else _earlyIpcDisconnect = true;
+      break;
+    }
     case "http-request":
       handleHttpRequest(msg as any);
       break;
@@ -275,10 +356,14 @@ self.addEventListener("message", (ev: MessageEvent) => {
 });
 
 async function handleInit(msg: MainToWorker_Init): Promise<void> {
+  // WASI/napi-rs modules loaded by this process start with the memory they
+  // declare instead of their loader's fixed (often 1 GiB) reservation
+  installWasmMemoryClamp();
   _pid = msg.pid;
   _cwd = msg.cwd || "/";
   _env = msg.env || {};
   _shellOptions = msg.shell;
+  if (msg.fetchPolicy) applyFetchPolicy(msg.fetchPolicy);
 
   _volume = MemoryVolume.fromBinarySnapshot(msg.snapshot);
   _volume.setBulkMountHandler((snapshot) => {
@@ -299,35 +384,48 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
       createLazyFsClient(msg.lazyFsPort),
       msg.snapshot.lazyDirNames,
     );
+    // module loader: share package transforms with every other process
+    (globalThis as { __nodepodSharedTransforms?: unknown }).__nodepodSharedTransforms =
+      createSharedTransformClient(msg.lazyFsPort, msg.transformScopes);
   }
 
   // watch local writes and forward to main — suppressed during inbound vfs-sync to prevent echo
   _volume.watch("/", { recursive: true }, (event, filename) => {
     if (!filename || _suppressVFSWatch || isInternalVfsPath(filename)) return;
     try {
-      if (_volume!.existsSync(filename)) {
-        const stat = _volume!.statSync(filename);
-        if (stat.isDirectory()) {
-          post({
-            type: "vfs-write",
-            path: filename,
-            content: new ArrayBuffer(0),
-            isDirectory: true,
-          });
+      // existence and kind in one lookup, no stat object
+      const kind = _volume!.kindSync(filename);
+      if (kind !== null) {
+        if (kind === "directory") {
+          queueVfsOp({ path: filename, content: new ArrayBuffer(0), isDirectory: true });
         } else {
           const data = _volume!.readFileSync(filename);
           // must copy into a fresh ArrayBuffer — if the Uint8Array is backed by SAB (e.g. esbuild-wasm or any napi-rs wasm32-wasip1-threads module writing from shared memory), both .buffer.slice() and .slice() return SAB, which isn't transferable
           // postMessage would throw DataCloneError, the catch swallows it, main-thread VFS never learns about the write — this was what caused Vite dep-optimizer 504s (.vite/deps/*.js missing) and downstream 404s
           const buffer = new ArrayBuffer(data.byteLength);
           new Uint8Array(buffer).set(data);
-          post({ type: "vfs-write", path: filename, content: buffer, isDirectory: false }, [buffer]);
+          queueVfsOp({ path: filename, content: buffer, isDirectory: false }, buffer);
         }
       } else {
-        post({ type: "vfs-delete", path: filename });
+        queueVfsOp({ path: filename, deleted: true });
       }
     } catch {
       /* ignore */
     }
+  });
+
+  _volume.onNotificationBurst((start) => {
+    if (start) {
+      _vfsBurstDepth++;
+      return;
+    }
+    if (_vfsBurstDepth > 0 && --_vfsBurstDepth === 0) flushVfsBatch();
+  });
+
+  // metadata changes fire no watchers, so they get their own channel
+  _volume.onMetaChange((path, change) => {
+    if (_suppressVFSWatch || isInternalVfsPath(path)) return;
+    post({ type: "vfs-meta", path, ...change });
   });
 
   if (msg.syncBuffer) {
@@ -336,18 +434,32 @@ async function handleInit(msg: MainToWorker_Init): Promise<void> {
   // if main had SAB off, neither buffer was sent
   _sabEnabled = !!msg.syncBuffer;
 
-  installSqliteHostBridge();
+  // installs leave their package pack to the main thread, which has the same
+  // files: the install is over as soon as they are in place
+  if (msg.deferPackSave) {
+    (globalThis as { __nodepodDeferPackSave?: (key: string) => boolean }).__nodepodDeferPackSave = (key) => {
+      post({ type: "pack-save", key });
+      return true;
+    };
+  }
+
+  const sqliteBridge = installSqliteHostBridge();
 
   if (msg.sqliteStartup === "bytes") {
-    warmSqliteWasmBytes();
-  } else {
-    // DatabaseSync must be ready before synchronous user code can construct it
+    // have the main thread cache the bytes for the processes an install
+    // runs, without holding this one up while they download
+    if (sqliteBridge) post({ type: "sqlite-preload", sab: null });
+  } else if (msg.sqliteStartup === "engine" || !sqliteBridge) {
+    // without the host bridge a cold DatabaseSync has no synchronous way to
+    // get the wasm, so the engine must be ready before user code runs
     try {
       await warmSqliteEngine();
     } catch (err) {
       console.warn("[node:sqlite] automatic initialization failed:", err);
     }
   }
+  // lazy: most processes never touch node:sqlite; the first DatabaseSync
+  // blocks on the bridge for the bytes and instantiates in place
 
   _initialized = true;
   post({ type: "ready", pid: _pid });
@@ -447,6 +559,7 @@ async function handleShellExec(msg: MainToWorker_Exec): Promise<void> {
       getCols: () => _cols,
       getRows: () => _rows,
       onRawModeChange: postStdinRawStatus,
+      isTTY: msg.stdoutIsTTY !== false,
     });
 
     // shellExec(), NOT child_process.exec() — the latter spawns a new worker and recurses
@@ -507,10 +620,14 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
     const shell = await ensureShell();
 
     // enable IPC for forks — process.send() goes out as postMessage to main
-    if (msg.isFork) {
+    if (msg.isFork && !msg.isWorkerThread) {
       shell.setIPCSend((data: unknown) => {
         post({ type: "ipc-message", data });
-      });
+      }, msg.serialization, () => post({ type: "ipc-disconnect" }));
+      if (_earlyIpcDisconnect) {
+        _earlyIpcDisconnect = false;
+        shell.handleIPCDisconnect();
+      }
     }
 
     let workerThreadsOverride: {
@@ -595,6 +712,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
       getCols: () => _cols,
       getRows: () => _rows,
       onRawModeChange: postStdinRawStatus,
+      isTTY: msg.stdoutIsTTY !== false,
     });
 
     const ctx = {
@@ -617,6 +735,7 @@ async function handleFileExec(msg: MainToWorker_Exec): Promise<void> {
 
     const result = await shell.executeNodeBinary(filePath, args, ctx, {
       isFork: !!msg.isFork,
+      execArgv: msg.execArgv,
       workerThreadsOverride,
       onModuleLoad: postModuleLoad,
     });
@@ -720,7 +839,7 @@ async function handleHttpRequest(msg: {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: string | null;
+  body: string | ArrayBuffer | null;
 }): Promise<void> {
   try {
     const httpMod = await import("../polyfills/http");
@@ -738,7 +857,8 @@ async function handleHttpRequest(msg: {
     }
 
     const { Buffer } = await import("../polyfills/buffer");
-    const bodyBuf = msg.body ? Buffer.from(msg.body) : undefined;
+    // binary request bodies arrive as a transferred ArrayBuffer (wrapped, not copied)
+    const bodyBuf = msg.body ? (Buffer.from(msg.body as string) as any) : undefined;
     const result = await server.dispatchRequest(
       msg.method,
       msg.path,
@@ -756,10 +876,21 @@ async function handleHttpRequest(msg: {
         bodyVal = result.body;
       } else if (result.body instanceof Uint8Array || Buffer.isBuffer(result.body)) {
         const bytes = result.body instanceof Uint8Array ? result.body : new Uint8Array(result.body);
-        const ab = new ArrayBuffer(bytes.byteLength);
-        new Uint8Array(ab).set(bytes);
-        bodyVal = ab;
-        transferList.push(ab);
+        if (
+          httpMod.isOwnedResponseBody(bytes) &&
+          bytes.buffer instanceof ArrayBuffer &&
+          bytes.byteOffset === 0 &&
+          bytes.byteLength === bytes.buffer.byteLength
+        ) {
+          // the response's own fresh buffer: hand it over as is
+          bodyVal = bytes.buffer;
+          transferList.push(bytes.buffer);
+        } else {
+          const ab = new ArrayBuffer(bytes.byteLength);
+          new Uint8Array(ab).set(bytes);
+          bodyVal = ab;
+          transferList.push(ab);
+        }
       } else {
         bodyVal = String(result.body);
       }
@@ -792,11 +923,20 @@ function handleHttpClientResponse(msg: {
   statusMessage: string;
   headers: Record<string, string | string[]>;
   body: string | ArrayBuffer;
+  connectionRefused?: boolean;
 }): void {
   const entry = _httpClientCallbacks.get(msg.requestId);
   if (!entry) return;
   _httpClientCallbacks.delete(msg.requestId);
   clearTimeout(entry.timer);
+  if (msg.connectionRefused) {
+    const err = new Error("connect ECONNREFUSED") as NodeJS.ErrnoException;
+    err.code = "ECONNREFUSED";
+    err.errno = -111;
+    (err as any).syscall = "connect";
+    entry.reject(err);
+    return;
+  }
   void (async () => {
     const { Buffer } = await import("../polyfills/buffer");
     let bodyVal: Buffer | string | null = null;
@@ -937,9 +1077,12 @@ export function forkChild(
   opts: {
     cwd: string;
     env: Record<string, string>;
+    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
     onIPC?: (data: unknown) => void;
+    onDisconnect?: () => void;
     onExit?: (exitCode: number) => void;
   },
 ): { sendIPC: (data: unknown) => void; disconnect: () => void; kill: (signal?: string) => boolean; requestId: number } {
@@ -948,10 +1091,12 @@ export function forkChild(
   if (opts.onIPC) {
     _ipcCallbacks.set(requestId, opts.onIPC);
   }
+  if (opts.onDisconnect) _ipcDisconnectCallbacks.set(requestId, opts.onDisconnect);
 
   _spawnCallbacks.set(requestId, (result: any) => {
     if (result.error) {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
       opts.onStderr?.(`Fork error: ${result.error}\n`);
       opts.onExit?.(1);
       return;
@@ -967,6 +1112,7 @@ export function forkChild(
 
     _childExitCallbacks.set(requestId, (exitCode: number) => {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
       opts.onExit?.(exitCode);
     });
   });
@@ -978,6 +1124,8 @@ export function forkChild(
     args,
     cwd: opts.cwd,
     env: opts.env,
+    serialization: opts.serialization,
+    execArgv: opts.execArgv,
   });
 
   return {
@@ -991,6 +1139,8 @@ export function forkChild(
     },
     disconnect: () => {
       _ipcCallbacks.delete(requestId);
+      _ipcDisconnectCallbacks.delete(requestId);
+      post({ type: "ipc-disconnect", targetRequestId: requestId });
     },
     kill: (signal = "SIGTERM") => {
       post({ type: "child-signal", requestId, signal });
@@ -1007,6 +1157,7 @@ function workerThreadFork(
     threadId: number;
     isEval?: boolean;
     rawWasi?: boolean;
+    argv?: string[];
     cwd: string;
     env: Record<string, string>;
     onMessage: (data: unknown) => void;
@@ -1072,7 +1223,7 @@ function workerThreadFork(
       requestId,
       modulePath,
       isEval: opts.isEval,
-      args: [],
+      args: opts.argv ?? [],
       cwd: opts.cwd,
       env: opts.env,
       workerData: opts.workerData,

@@ -5,6 +5,9 @@
 // environments) degrade to a no-op: every operation is best-effort and a
 // failure is just a cache miss.
 
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex } from "@noble/hashes/utils";
+
 const DB_NAME = "nodepod-wasm-modules";
 const STORE_NAME = "wasmModules";
 const DB_VERSION = 1;
@@ -23,30 +26,36 @@ export interface WasmModuleCache {
   close(): void;
 }
 
-// Fast synchronous content hash: dual-lane FNV-1a over the full buffer plus
-// the byte length. Used as the in-memory (L1) cache key where we cannot
-// await crypto.subtle. One pass over 16MB costs single-digit milliseconds.
-export function quickWasmHash(bytes: Uint8Array): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0xcbf29ce4;
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ b, 0x01000197) >>> 0;
-  }
-  return `${h1.toString(16)}-${h2.toString(16)}-${bytes.length.toString(16)}`;
+// Sync constructors cannot await crypto.subtle. Hash every byte before
+// reusing executable code: a sampled key can miss changes to instructions.
+let activeContentHashes = 0;
+
+// A hash implementation may compile WASM on first use. Its own constructor
+// must bypass caching until the content hash is ready, avoiding recursion.
+export function isHashingWasmContent(): boolean {
+  return activeContentHashes > 0;
 }
 
-// Strong content hash for the persistent (IDB) key. Falls back to the quick
-// hash when crypto.subtle is unavailable (insecure contexts).
+export function quickWasmHash(bytes: Uint8Array): string {
+  activeContentHashes++;
+  try {
+    return bytesToHex(sha256(bytes));
+  } finally {
+    activeContentHashes--;
+  }
+}
+
+// Persistent keys use the same digest even without crypto.subtle.
 export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
   try {
     const subtle = globalThis.crypto?.subtle;
     if (subtle) {
-      const buf = bytes.buffer.slice(
-        bytes.byteOffset,
-        bytes.byteOffset + bytes.byteLength,
-      ) as ArrayBuffer;
+      // (a view is hashed as it is, unless it is over shared memory, which
+      // subtle rejects: then a copy)
+      const buf =
+        typeof SharedArrayBuffer !== "undefined" && bytes.buffer instanceof SharedArrayBuffer
+          ? new Uint8Array(bytes)
+          : (bytes as Uint8Array<ArrayBuffer>);
       const digest = await subtle.digest("SHA-256", buf);
       return Array.from(new Uint8Array(digest))
         .map((b) => b.toString(16).padStart(2, "0"))
@@ -55,7 +64,7 @@ export async function wasmContentHash(bytes: Uint8Array): Promise<string> {
   } catch {
     /* fall through */
   }
-  return "fnv:" + quickWasmHash(bytes);
+  return quickWasmHash(bytes);
 }
 
 function openDB(): Promise<IDBDatabase | null> {

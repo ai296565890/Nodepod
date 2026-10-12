@@ -61,7 +61,8 @@ function formatInternal(
   return result;
 }
 
-export function format(template: unknown, ...values: unknown[]): string {
+export function format(template?: unknown, ...values: unknown[]): string {
+  if (arguments.length === 0) return "";
   return formatInternal({}, template, values);
 }
 
@@ -70,12 +71,17 @@ export function format(template: unknown, ...values: unknown[]): string {
  * supplied options to `inspect()` for object rendering. Mirrors
  * `node:util.formatWithOptions()`.
  */
-export function formatWithOptions(
-  inspectOptions: InspectOptions | undefined,
-  template: unknown,
-  ...values: unknown[]
-): string {
-  return formatInternal(inspectOptions ?? {}, template, values);
+// format() with inspect options first (the `debug` package logs through it)
+export function formatWithOptions(inspectOptions: unknown, ...args: unknown[]): string {
+  if (inspectOptions === null || typeof inspectOptions !== "object") {
+    const err = new TypeError(
+      `The "inspectOptions" argument must be of type object. Received ${inspectOptions === null ? "null" : typeof inspectOptions}`,
+    ) as TypeError & { code?: string };
+    err.code = "ERR_INVALID_ARG_TYPE";
+    throw err;
+  }
+  if (args.length === 0) return "";
+  return formatInternal(inspectOptions as InspectOptions, args[0], args.slice(1));
 }
 
 export function inspect(

@@ -22,7 +22,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --filter @scelar/nodepod...
+        run: pnpm install --frozen-lockfile --filter @r1ck404/nodepod...
 
       - name: Type check
         run: pnpm run type-check
@@ -40,6 +40,15 @@ jobs:
 
       - name: Browser preview regression
         run: pnpm run test:browser:preview
+
+      - name: Upload failed browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodepod-browser-test-results
+          path: test-results
+          if-no-files-found: ignore
+          retention-days: 14
 
   documentation:
     runs-on: ubuntu-latest
@@ -61,10 +70,10 @@ jobs:
         run: pnpm run docs:check
 
       - name: Install Chromium
-        run: pnpm --filter @scelar/nodepod-site exec playwright install --with-deps chromium
+        run: pnpm --filter nodepod-site exec playwright install --with-deps chromium
 
       - name: Test production documentation preview
-        run: pnpm --filter @scelar/nodepod-site test
+        run: pnpm --filter nodepod-site test
 
       - name: Upload documentation test report
         if: always()

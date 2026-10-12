@@ -3,6 +3,7 @@
 
 import { EventEmitter } from "../polyfills/events";
 import type { HostWorker } from "../host/types";
+import { attachWasmMessageMetadata, receiveWasmMessageMetadata } from "../helpers/wasm-message-metadata";
 import type {
   MainToWorkerMessage,
   WorkerToMainMessage,
@@ -82,7 +83,7 @@ export class ProcessHandle extends EventEmitter {
   }
 
   postMessage(msg: MainToWorkerMessage, transfer?: Transferable[]): void {
-    this.worker.postMessage(msg, transfer ?? []);
+    this.worker.postMessage(attachWasmMessageMetadata(msg), transfer ?? []);
   }
 
   init(initMsg: MainToWorker_Init, extraTransfer?: Transferable[]): void {
@@ -104,7 +105,12 @@ export class ProcessHandle extends EventEmitter {
     this.postMessage(initMsg, transfer);
   }
 
+  // whether this process's stdout is a terminal (a child spawned with
+  // stdio "inherit" gets the same)
+  stdoutIsTTY = true;
+
   exec(execMsg: MainToWorker_Exec): void {
+    if (execMsg.stdoutIsTTY !== undefined) this.stdoutIsTTY = execMsg.stdoutIsTTY;
     this.postMessage(execMsg);
   }
 
@@ -132,8 +138,18 @@ export class ProcessHandle extends EventEmitter {
     }
   }
 
+  // last terminal size sent to this process; children that share its tty
+  // start from it (ProcessManager relays later resizes to them)
+  private _terminalSize: { cols: number; rows: number } | null = null;
+
+  get terminalSize(): { cols: number; rows: number } | null {
+    return this._terminalSize;
+  }
+
   resize(cols: number, rows: number): void {
+    this._terminalSize = { cols, rows };
     this.postMessage({ type: "resize", cols, rows });
+    this.emit("resize", cols, rows);
   }
 
   holdExit(): void {
@@ -185,7 +201,7 @@ export class ProcessHandle extends EventEmitter {
   private _setupWorkerListeners(worker: HostWorker): void {
     worker.addEventListener("message", (ev) => {
       if (worker !== this.worker) return;
-      const msg = ev.data as WorkerToMainMessage;
+      const msg = receiveWasmMessageMetadata(ev.data) as WorkerToMainMessage;
       if (!msg || !msg.type) return;
 
       switch (msg.type) {
@@ -254,8 +270,20 @@ export class ProcessHandle extends EventEmitter {
           this.emit("vfs-delete", msg.path);
           break;
 
+        case "vfs-batch":
+          // the same events, in order, as separate messages would have made
+          for (const op of msg.ops) {
+            if ("deleted" in op) this.emit("vfs-delete", op.path);
+            else this.emit("vfs-write", op.path, op.content, op.isDirectory);
+          }
+          break;
+
         case "vfs-snapshot":
           this.emit("vfs-snapshot", msg.snapshot);
+          break;
+
+        case "vfs-meta":
+          this.emit("vfs-meta", msg);
           break;
 
         case "spawn-request":
@@ -290,12 +318,28 @@ export class ProcessHandle extends EventEmitter {
           this.emit("ipc-message", msg);
           break;
 
+        case "ipc-disconnect":
+          this.emit("ipc-disconnect", msg);
+          break;
+
         case "spawn-sync":
           this.emit("spawn-sync", msg);
           break;
 
+        case "sync-more":
+          this.emit("sync-more", msg.syncSlot);
+          break;
+
         case "sqlite-preload":
           this.emit("sqlite-preload", msg);
+          break;
+
+        case "pack-save":
+          this.emit("pack-save", msg);
+          break;
+
+        case "esbuild-module-request":
+          this.emit("esbuild-module-request");
           break;
 
         case "server-listen":

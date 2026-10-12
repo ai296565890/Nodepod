@@ -10,16 +10,19 @@ sidebar:
 Nodepod's browser entry requires Node 20 or newer in your build tooling.
 
 ```bash
-npm install @scelar/nodepod
+npm install @r1ck404/nodepod
 ```
 
 For pnpm or Yarn, use the equivalent add command. Nodepod publishes both ESM
 and CommonJS builds; the examples here use ESM syntax.
 
+Nodepod used to be published as `@scelar/nodepod`. That name is deprecated;
+replace it with `@r1ck404/nodepod` (same API and subpaths).
+
 ## Boot and run
 
 ```ts
-import { Nodepod } from '@scelar/nodepod';
+import { Nodepod } from '@r1ck404/nodepod';
 
 const nodepod = await Nodepod.boot({
   files: {
@@ -36,7 +39,7 @@ await process.completion;
 `Nodepod.boot()` creates an isolated runtime instance and seeds its in-memory filesystem. `spawn()` creates a worker-backed process. Always release an instance when your application no longer needs it:
 
 ```ts
-nodepod.teardown();
+await nodepod.teardown();
 ```
 
 ## Choose service-worker behaviour

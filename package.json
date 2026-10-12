@@ -1,6 +1,6 @@
 {
-  "name": "@scelar/nodepod",
-  "version": "1.9.21",
+  "name": "@r1ck404/nodepod",
+  "version": "1.11.2",
   "description": "Browser-native Node.js runtime environment",
   "type": "module",
   "license": "MIT WITH Commons-Clause",
@@ -13,6 +13,10 @@
     "url": "https://github.com/R1ck404/Nodepod/issues"
   },
   "homepage": "https://r1ck404.github.io/Nodepod/",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/R1ck404"
+  },
   "keywords": [
     "node",
     "browser",
@@ -107,22 +111,23 @@
     "test:watch": "vitest",
     "test:browser:preview": "playwright test --config playwright.preview.config.ts",
     "test:browser:perf": "pnpm run build:publish && playwright test --config playwright.perf.config.ts",
-    "docs:dev": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site dev",
-    "docs:build": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site build",
-    "docs:check": "pnpm run build:publish && pnpm --filter @scelar/nodepod-site check",
-    "docs:test": "pnpm run docs:build && pnpm --filter @scelar/nodepod-site test",
+    "docs:dev": "pnpm run build:publish && pnpm --filter nodepod-site dev",
+    "docs:build": "pnpm run build:publish && pnpm --filter nodepod-site build",
+    "docs:check": "pnpm run build:publish && pnpm --filter nodepod-site check",
+    "docs:test": "pnpm run docs:build && pnpm --filter nodepod-site test",
     "bench": "vitest bench",
     "bench:run": "vitest bench --run",
     "prepublishOnly": "pnpm run build:publish"
   },
   "dependencies": {
-    "@noble/hashes": "^1.8.0",
-    "acorn": "^8.15.0",
-    "acorn-jsx": "^5.3.2",
+    "@noble/hashes": "npm:@r1ck404/fast-noble-hashes@1.8.2",
+    "acorn": "npm:@r1ck404/fast-acorn@8.18.2",
+    "acorn-jsx": "npm:@r1ck404/fast-acorn-jsx@5.3.4",
     "brotli": "^1.3.3",
-    "brotli-wasm": "^3.0.1",
+    "brotli-wasm": "npm:@r1ck404/fast-brotli-wasm@3.0.3",
     "comlink": "^4.4.2",
-    "pako": "^2.1.0",
+    "es-module-lexer": "npm:@r1ck404/fast-es-module-lexer@1.7.2",
+    "pako": "npm:@r1ck404/fast-pako@2.1.2",
     "resolve.exports": "^2.0.3",
     "set-cookie-parser": "^3.1.1"
   },
@@ -161,6 +166,7 @@
     "better-auth": "^1.2.10",
     "better-call": "1.3.7",
     "esbuild": "^0.27.2",
+    "fake-indexeddb": "^6.2.5",
     "http-proxy": "^1.18.1",
     "next": "^16.2.9",
     "typescript": "^5.9.3",

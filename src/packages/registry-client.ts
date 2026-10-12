@@ -36,13 +36,23 @@ export interface RegistryConfig {
 }
 
 import { NPM_REGISTRY_URL } from "../constants/config";
-import { getProxy, proxiedFetch } from "../cross-origin";
+import { getProxy } from "../cross-origin";
 import type { NodepodProfilerImpl } from "../profiling/profiler";
+import {
+  fetchWithRetry,
+  METADATA_TIMEOUT_MS,
+  readBodyWithTimeout,
+  RegistryFetchError,
+  TARBALL_TIMEOUT_MS,
+} from "./registry-fetch";
 
 const NPM_REGISTRY_BASE = NPM_REGISTRY_URL;
 const REGISTRY_CACHE_NAME = "nodepod-registry-v1";
 const REGISTRY_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const REGISTRY_MEMORY_MAX_ENTRIES = 256;
+// how long a 404 answers repeat requests (a package published meanwhile is
+// found again after this)
+const NOT_FOUND_TTL_MS = 60_000;
 const sharedMetadata = new Map<string, PackageMetadata>();
 const inFlightMetadata = new Map<string, Promise<PackageMetadata>>();
 
@@ -56,14 +66,21 @@ function remember(key: string, metadata: PackageMetadata): void {
   }
 }
 
-async function openRegistryCache(): Promise<Cache | null> {
-  if (typeof caches === "undefined") return null;
-  try {
-    return await caches.open(REGISTRY_CACHE_NAME);
-  } catch {
-    return null;
+// opened once, not per manifest
+let registryCache: Promise<Cache | null> | null = null;
+
+function openRegistryCache(): Promise<Cache | null> {
+  if (typeof caches === "undefined") return Promise.resolve(null);
+  if (!registryCache) {
+    registryCache = caches.open(REGISTRY_CACHE_NAME).catch(() => {
+      registryCache = null; // try again next time
+      return null;
+    });
   }
+  return registryCache;
 }
+
+const manifestDecoder = new TextDecoder();
 
 // @scope/pkg -> @scope%2fpkg
 function encodeForUrl(pkgName: string): string {
@@ -73,6 +90,10 @@ function encodeForUrl(pkgName: string): string {
 export class RegistryClient {
   private baseUrl: string;
   private metadataStore: Map<string, PackageMetadata>;
+  // packages the registry just said don't exist: an install asks for some
+  // names twice (the resolver's prefetch, then its walk; wasm variant
+  // guesses), and a 404 answers both
+  private notFound = new Map<string, { error: Error; at: number }>();
   private profiler: NodepodProfilerImpl | null;
 
   constructor(config: RegistryConfig = {}) {
@@ -95,6 +116,9 @@ export class RegistryClient {
       this.metadataStore.set(name, shared);
       return shared;
     }
+    const miss = this.notFound.get(name);
+    if (miss && Date.now() - miss.at < NOT_FOUND_TTL_MS) throw miss.error;
+
     const pending = inFlightMetadata.get(sharedKey);
     if (pending) return pending;
 
@@ -102,6 +126,11 @@ export class RegistryClient {
     inFlightMetadata.set(sharedKey, request);
     try {
       return await request;
+    } catch (err) {
+      if (err instanceof Error && err.message.endsWith("does not exist in the registry")) {
+        this.notFound.set(name, { error: err, at: Date.now() });
+      }
+      throw err;
     } finally {
       inFlightMetadata.delete(sharedKey);
     }
@@ -149,16 +178,27 @@ export class RegistryClient {
           "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
       },
     };
+    // Bounded: a relay that never answers must not pin the whole install
+    // (`Resolving foo@latest` forever) until the caller's watchdog fires.
     let resp: Response;
     let proxyFallbackFailed: string | null = null;
     try {
-      resp = await proxiedFetch(requestUrl, requestInit);
+      resp = await fetchWithRetry(requestUrl, {
+        timeoutMs: METADATA_TIMEOUT_MS,
+        init: requestInit,
+        label: `registry metadata for "${name}"`,
+      });
       // Some configured CORS proxies return a synthetic 404 when they are
       // unavailable. Retry the registry directly so a real package (React is
       // the common example) is not reported as missing.
       if (resp.status === 404 && getProxy()) {
         try {
-          resp = await fetch(requestUrl, requestInit);
+          resp = await fetchWithRetry(requestUrl, {
+            timeoutMs: METADATA_TIMEOUT_MS,
+            init: requestInit,
+            label: `registry metadata for "${name}"`,
+            fetchImpl: (url, init) => fetch(url, init),
+          });
         } catch (error) {
           proxyFallbackFailed =
             error instanceof Error ? error.message : String(error);
@@ -187,7 +227,22 @@ export class RegistryClient {
       );
     }
 
-    const metadata = (await resp.json()) as PackageMetadata;
+    let metadata: PackageMetadata;
+    let bytes: ArrayBuffer;
+    try {
+      bytes = await readBodyWithTimeout(
+        resp,
+        METADATA_TIMEOUT_MS,
+        `registry metadata for "${name}"`,
+      );
+      metadata = JSON.parse(manifestDecoder.decode(bytes)) as PackageMetadata;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Registry metadata for "${name}" could not be read (${detail})`);
+    }
+    if (!metadata || typeof metadata !== "object" || !metadata.versions) {
+      throw new Error(`Registry metadata for "${name}" is malformed`);
+    }
     this.metadataStore.set(name, metadata);
     remember(sharedKey, metadata);
 
@@ -195,8 +250,9 @@ export class RegistryClient {
       const headers = new Headers(resp.headers);
       headers.set("content-type", "application/json");
       headers.set("x-nodepod-stored-at", String(Date.now()));
-      const body = JSON.stringify(metadata);
-      void persistentCache.put(requestUrl, new Response(body, {
+      // the document as received: re-serializing the parsed copy cost as
+      // much as parsing it
+      void persistentCache.put(requestUrl, new Response(bytes, {
         status: 200,
         headers,
       })).catch(() => {});
@@ -242,22 +298,8 @@ export class RegistryClient {
       category: "packages",
       metadata: { url: tarballUrl },
     }) ?? null;
-    let resp: Response;
     try {
-      resp = await proxiedFetch(tarballUrl);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      this.profiler?.end(profileSpan);
-      throw new Error(
-        `Tarball download failed (${detail}): ${tarballUrl}`,
-      );
-    }
-    if (!resp.ok) {
-      this.profiler?.end(profileSpan);
-      throw new Error(`Tarball download failed (HTTP ${resp.status}): ${tarballUrl}`);
-    }
-    try {
-      return await resp.arrayBuffer();
+      return await downloadTarball(tarballUrl);
     } finally {
       this.profiler?.end(profileSpan);
     }
@@ -265,6 +307,31 @@ export class RegistryClient {
 
   flushCache(): void {
     this.metadataStore.clear();
+  }
+}
+
+/** Download a tarball with per-attempt deadlines and bounded retries. */
+export async function downloadTarball(tarballUrl: string): Promise<ArrayBuffer> {
+  let resp: Response;
+  try {
+    resp = await fetchWithRetry(tarballUrl, {
+      timeoutMs: TARBALL_TIMEOUT_MS,
+      label: "tarball download",
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Tarball download failed (${detail}): ${tarballUrl}`);
+  }
+  if (!resp.ok) {
+    throw new Error(`Tarball download failed (HTTP ${resp.status}): ${tarballUrl}`);
+  }
+  try {
+    return await readBodyWithTimeout(resp, TARBALL_TIMEOUT_MS, "tarball download");
+  } catch (error) {
+    if (error instanceof RegistryFetchError) {
+      throw new Error(`Tarball download failed (${error.message}): ${tarballUrl}`);
+    }
+    throw error;
   }
 }
 

@@ -8,6 +8,32 @@ import {
 } from "../polyfills/stream";
 
 describe("Readable", () => {
+  it("closes after end when EOF is pushed to a flowing stream", async () => {
+    // how a child process's stdout ends: data first, then push(null)
+    const r = new Readable();
+    const events: string[] = [];
+    r.on("data", () => events.push("data"));
+    r.on("end", () => events.push("end"));
+    r.on("close", () => events.push("close"));
+    r.push("chunk");
+    await new Promise((res) => setTimeout(res, 0));
+    r.push(null);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(events).toEqual(["data", "end", "close"]);
+  });
+
+  it("keeps a duplex open while its writable side is still open", async () => {
+    const p = new PassThrough();
+    const events: string[] = [];
+    p.on("data", () => {});
+    p.on("end", () => events.push("end"));
+    p.on("close", () => events.push("close"));
+    p.push(null);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(events).toEqual(["end"]);
+    expect(p.destroyed).toBe(false);
+  });
+
   it("push() queues data, data event fires in flowing mode", () => {
     const r = new Readable({ read() {} });
     const chunks: string[] = [];
@@ -99,6 +125,30 @@ describe("PassThrough", () => {
     pt.write("data");
     pt.end();
     expect(chunks).toContain("data");
+  });
+
+  // fast-glob's static-pattern reader (prettier's file expansion): the
+  // PassThrough's own _write takes each chunk, pushes the entry it resolves
+  // and ends the stream. Writes skipped it, so 'end' never came and
+  // `prettier file.js` exited without output.
+  it("hands writes to a _write of its own", async () => {
+    const stream = new PassThrough({ objectMode: true });
+    const paths = ["a.js", "b.js"];
+    (stream as any)._write = (index: number, _enc: string, done: () => void) => {
+      Promise.resolve({ path: paths[index] }).then((entry) => {
+        stream.push(entry);
+        if (index === paths.length - 1) stream.end();
+        done();
+      });
+    };
+    for (let i = 0; i < paths.length; i++) stream.write(i);
+    const entries = await new Promise<unknown[]>((resolve, reject) => {
+      const seen: unknown[] = [];
+      stream.once("error", reject);
+      stream.on("data", (entry: unknown) => seen.push(entry));
+      stream.once("end", () => resolve(seen));
+    });
+    expect(entries).toEqual([{ path: "a.js" }, { path: "b.js" }]);
   });
 });
 

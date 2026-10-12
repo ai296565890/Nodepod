@@ -5,6 +5,7 @@ import {
   VERSIONS,
   NODE_SUB_VERSIONS,
   MOCK_OS,
+  MOCK_IDS,
   MOCK_PROCESS,
   MOCK_MEMORY,
   DEFAULT_ENV,
@@ -12,6 +13,7 @@ import {
 } from "../constants/config";
 import {
   getRegistry,
+  isExitSentinel,
   ProcessExitSentinel,
   type Handle,
 } from "./../helpers/event-loop";
@@ -134,6 +136,11 @@ export interface ProcessObject {
   abort: () => never;
   kill: (pid: number, signal?: string | number) => boolean;
   umask: (mask?: number) => number;
+  getuid: () => number;
+  geteuid: () => number;
+  getgid: () => number;
+  getegid: () => number;
+  getgroups: () => number[];
   config: {
     variables: Record<string, unknown>;
     target_defaults: Record<string, unknown>;
@@ -634,8 +641,6 @@ export function buildProcessEnv(config?: {
     env: envVars,
 
     cwd() {
-      if (!proc._debugCwdCalls) proc._debugCwdCalls = 0;
-      proc._debugCwdCalls++;
       return workingDir;
     },
 
@@ -676,9 +681,63 @@ export function buildProcessEnv(config?: {
       throw new ProcessExitSentinel(resolved);
     },
 
-    nextTick(fn, ...args) {
-      queueMicrotask(() => fn(...args));
-    },
+    // Node drains the entire nextTick queue before the promise microtask
+    // queue (including nextTicks queued during the drain), so chained
+    // nextTick callbacks run before already-queued promise callbacks.
+    // A raw queueMicrotask would interleave them FIFO instead.
+    // A throwing callback goes to 'uncaughtException' listeners and the
+    // drain continues, like node. Without a listener the error is rethrown
+    // as uncaught (node dies there); anything left runs on a later pump in
+    // case the process survives it. process.exit() ends the drain.
+    nextTick: (() => {
+      // callbacks and their arguments side by side (undefined: none), no
+      // closure per tick
+      const pending: Array<(...args: unknown[]) => void> = [];
+      const pendingArgs: Array<unknown[] | undefined> = [];
+      let pumpScheduled = false;
+      const drain = () => {
+        pumpScheduled = false;
+        let i = 0;
+        try {
+          while (i < pending.length) {
+            const fn = pending[i];
+            const args = pendingArgs[i];
+            i++;
+            try {
+              if (args === undefined) fn();
+              else fn(...args);
+            } catch (e) {
+              // process.exit() already ran; the sentinel only unwinds.
+              // Drop the rest of the queue, as timers do.
+              if (isExitSentinel(e)) {
+                i = pending.length;
+                return;
+              }
+              if (bus.listenerCount("uncaughtException") > 0) {
+                bus.emit("uncaughtException", e, "uncaughtException");
+                continue;
+              }
+              throw e;
+            }
+          }
+        } finally {
+          pending.splice(0, i);
+          pendingArgs.splice(0, i);
+          if (pending.length > 0 && !pumpScheduled) {
+            pumpScheduled = true;
+            queueMicrotask(drain);
+          }
+        }
+      };
+      return (fn: (...args: unknown[]) => void, ...args: unknown[]) => {
+        pending.push(fn);
+        pendingArgs.push(args.length === 0 ? undefined : args);
+        if (!pumpScheduled) {
+          pumpScheduled = true;
+          queueMicrotask(drain);
+        }
+      };
+    })(),
 
     stdout: stdoutStream,
     stderr: stderrStream,
@@ -736,6 +795,14 @@ export function buildProcessEnv(config?: {
       if (mask !== undefined) currentUmask = mask;
       return old;
     },
+
+    // the user that os.userInfo() reports and files belong to. `which` (zx,
+    // npm) checks exec bits against these and finds nothing without them
+    getuid: () => MOCK_IDS.UID,
+    geteuid: () => MOCK_IDS.UID,
+    getgid: () => MOCK_IDS.GID,
+    getegid: () => MOCK_IDS.GID,
+    getgroups: () => [MOCK_IDS.GID],
 
     config: { variables: {}, target_defaults: {} },
     release: { name: "node", sourceUrl: "", headersUrl: "" },

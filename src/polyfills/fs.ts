@@ -16,13 +16,53 @@ import {
 } from "../helpers/wasm-cdn";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
-import type { FsReadStreamInstance, FsWriteStreamInstance, FsReadableState, FsWritableState } from "../types/fs-streams";
-import { getRegistry } from "../helpers/event-loop";
+import type { FsReadStreamInstance, FsReadableState, FsWriteStreamInstance, FsWriteStreamOptions } from "../types/fs-streams";
+import { getRegistry, isExitSentinel, type Handle } from "../helpers/event-loop";
+import { setImmediate as scheduleImmediate } from "./timers";
+import { settledPromise, settledResolve, settledReject } from "../helpers/sync-scope";
 
 export type { FileStat, FileWatchHandle, WatchCallback, WatchEventKind };
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
+
+// Callback-style fs completions, like node's I/O callbacks: each runs in a
+// task of its own (so promise continuations and nextTicks run between two
+// of them) and keeps the event loop alive until it has. One MessageChannel
+// message per callback: setTimeout(0) cost >= 1ms per call and browsers
+// clamp nested timers to 4ms, which made callback-driven directory walks
+// crawl.
+const _fsCallbacks: Array<{ handle: Handle; fn: () => void }> = [];
+let _fsCallbackPort: MessagePort | null = null;
+
+function runNextFsCallback(): void {
+  const next = _fsCallbacks.shift();
+  if (!next) return;
+  next.handle.close();
+  try {
+    next.fn();
+  } catch (e) {
+    if (isExitSentinel(e)) return;
+    // an uncaught error in a callback, as in node
+    queueMicrotask(() => {
+      throw e;
+    });
+  }
+}
+
+function deferCallback(fn: () => void): void {
+  if (typeof MessageChannel === "undefined") {
+    scheduleImmediate(fn);
+    return;
+  }
+  if (!_fsCallbackPort) {
+    const channel = new MessageChannel();
+    channel.port1.onmessage = runNextFsCallback;
+    _fsCallbackPort = channel.port2;
+  }
+  _fsCallbacks.push({ handle: getRegistry().register("FSReqCallback"), fn });
+  _fsCallbackPort.postMessage(0);
+}
 
 export type PathArg = string | URL;
 
@@ -425,6 +465,7 @@ export interface FsBridge {
   truncateSync(target: PathArg, len?: number): void;
   lchownSync(target: PathArg, uid: number, gid: number): void;
   lutimesSync(target: PathArg, atime: unknown, mtime: unknown): void;
+  futimesSync(fd: number, atime: unknown, mtime: unknown): void;
   fchownSync(fd: number, uid: number, gid: number): void;
   fchmodSync(fd: number, mode: number): void;
   openSync(target: string, flags: string | number, mode?: number): number;
@@ -546,10 +587,10 @@ export interface FsBridge {
   ): import("./stream").Readable;
   createWriteStream(
     target: string,
-    opts?: { encoding?: string; flags?: string },
-  ): import("./stream").Writable;
+    opts?: FsWriteStreamOptions,
+  ): FsWriteStreamInstance;
   ReadStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Readable;
-  WriteStream: new (path: unknown, opts?: Record<string, unknown>) => import("./stream").Writable;
+  WriteStream: new (path: unknown, opts?: FsWriteStreamOptions) => FsWriteStreamInstance;
   cpSync(src: unknown, dest: unknown, opts?: CpOptions): void;
   cp(src: unknown, dest: unknown, optsOrCb?: unknown, cb?: (err: Error | null) => void): void;
   readvSync(fd: number, buffers: ArrayBufferView[], pos?: number | null): number;
@@ -623,6 +664,33 @@ function resolvePath(target: unknown, cwdFn?: () => string): string {
 
 // plain Uint8Array.toString() returns comma-separated bytes, not UTF-8 text --
 // must wrap with Buffer.from() so .toString() works like Node's Buffer
+// dst[dstOff + i] = src[srcOff + i] for i < count: one native copy when both
+// are byte arrays and the range fits, the element loop otherwise (it
+// silently skips out-of-range indices, which set() would throw on)
+function copyBytes(
+  dst: ArrayLike<number> & { [i: number]: number },
+  dstOff: number,
+  src: ArrayLike<number>,
+  srcOff: number,
+  count: number,
+): void {
+  if (
+    count > 16 &&
+    dst instanceof Uint8Array &&
+    src instanceof Uint8Array &&
+    Number.isInteger(dstOff) &&
+    Number.isInteger(srcOff) &&
+    dstOff >= 0 &&
+    srcOff >= 0 &&
+    dstOff + count <= dst.length &&
+    srcOff + count <= src.length
+  ) {
+    dst.set(new Uint8Array(src.buffer, src.byteOffset + srcOff, count), dstOff);
+    return;
+  }
+  for (let i = 0; i < count; i++) dst[dstOff + i] = src[srcOff + i];
+}
+
 function wrapAsBuffer(raw: Uint8Array): Buffer {
   if (typeof (raw as any).readUInt8 === "function") return raw as Buffer;
   return Buffer.from(raw) as Buffer;
@@ -636,7 +704,39 @@ interface OpenFile {
   isDirectory?: boolean;
   /** Permission bits to apply on first persist of a newly created file. */
   createMode?: number;
+  /** the volume's stored array, lent to a read-only open: never written into */
+  borrowed?: Uint8Array;
+  /** futimes times, re-applied after each persist (which stamps "now") */
+  times?: [atime: number | Date, mtime: number | Date];
 }
+
+// an fd's bytes are about to be written in place: its own copy first if
+// they are still the volume's
+function ownFdData(entry: OpenFile): void {
+  if (entry.borrowed === undefined) return;
+  if (entry.data === entry.borrowed) entry.data = new Uint8Array(entry.data);
+  entry.borrowed = undefined;
+}
+
+// Keep logical length separate from spare backing capacity. Sequential small
+// writes otherwise allocate and copy the entire file on every append.
+function extendFdData(entry: OpenFile, length: number): void {
+  ownFdData(entry);
+  if (length <= entry.data.length) return;
+  const previous = entry.data;
+  const capacity = previous.buffer.byteLength - previous.byteOffset;
+  if (length <= capacity) {
+    entry.data = new Uint8Array(previous.buffer, previous.byteOffset, length);
+    entry.data.fill(0, previous.length);
+  } else {
+    const storage = new Uint8Array(Math.max(length, capacity * 2));
+    storage.set(previous);
+    entry.data = storage.subarray(0, length);
+  }
+}
+
+/** Key of the fs bridge's proxy helpers (a symbol, so user code never meets them). */
+export const FS_PROXY_INTERNALS = Symbol.for("nodepod.fsProxyInternals");
 
 export function buildFileSystemBridge(
   volume: MemoryVolume,
@@ -682,7 +782,18 @@ export function buildFileSystemBridge(
         volume.chmodSync(entry.filePath, entry.createMode & 0o777);
         entry.createMode = undefined;
       }
+      if (entry.times) volume.utimesSync(entry.filePath, entry.times[0], entry.times[1]);
     }
+  }
+
+  // futimes: a file created through this fd only reaches the volume on
+  // fsync/close, so persist it first; the persist at close keeps the times
+  function setFdTimes(fd: number, atime: unknown, mtime: unknown): void {
+    const entry = openFiles.get(fd);
+    if (!entry) throw makeBadfError("futimes");
+    entry.times = [atime as number | Date, mtime as number | Date];
+    persistWritableFd(fd);
+    volume.utimesSync(entry.filePath, entry.times[0], entry.times[1]);
   }
 
   const fsConst: FsConstantsShape = {
@@ -732,7 +843,16 @@ export function buildFileSystemBridge(
 
   // Helper to build Dirent array from directory entries
   function toDirents(dirPath: string, names: string[]): Dirent[] {
-    return names.map((name) => {
+    // every entry's kind from one lookup of the directory, not an lstat
+    // (and a stat object) per entry
+    const kinds = typeof volume.childKindsSync === "function"
+      ? volume.childKindsSync(dirPath, names)
+      : null;
+    return names.map((name, i) => {
+      const kind = kinds ? kinds[i] : null;
+      if (kind !== null) {
+        return new Dirent(name, kind === "directory", kind === "file", dirPath, kind === "symlink");
+      }
       const full = dirPath.endsWith("/")
         ? dirPath + name
         : dirPath + "/" + name;
@@ -799,7 +919,8 @@ export function buildFileSystemBridge(
 
   function decodeBytes(raw: Uint8Array, enc?: string | null): Buffer | string {
     if (!enc || enc === "buffer") return wrapAsBuffer(raw);
-    return Buffer.from(raw).toString(enc as BufferEncoding);
+    // decoding never writes: a view over the stored bytes, not a copy
+    return Buffer.from(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength).toString(enc as BufferEncoding);
   }
 
   function normalizeWriteData(
@@ -1120,7 +1241,7 @@ export function buildFileSystemBridge(
       const readAt = pos !== null ? pos : entry.cursor;
       const count = Math.min(len, entry.data.length - readAt);
       if (count <= 0) return Promise.resolve({ bytesRead: 0, buffer: buf });
-      for (let i = 0; i < count; i++) buf[off + i] = entry.data[readAt + i];
+      copyBytes(buf, off, entry.data, readAt, count);
       if (pos === null) entry.cursor += count;
       return Promise.resolve({ bytesRead: count, buffer: buf });
     }
@@ -1172,7 +1293,7 @@ export function buildFileSystemBridge(
         const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
         const count = Math.min(u8.length, entry.data.length - readPos);
         if (count <= 0) break;
-        for (let i = 0; i < count; i++) u8[i] = entry.data[readPos + i];
+        copyBytes(u8, 0, entry.data, readPos, count);
         readPos += count;
         totalRead += count;
         if (count < u8.length) break;
@@ -1214,10 +1335,8 @@ export function buildFileSystemBridge(
     }
 
     utimes(atime: unknown, mtime: unknown): Promise<void> {
-      const entry = openFiles.get(this.fd);
-      if (!entry) return Promise.reject(makeBadfError("futimes"));
       try {
-        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+        setFdTimes(this.fd, atime, mtime);
         return Promise.resolve();
       } catch (error) {
         return Promise.reject(error);
@@ -1252,15 +1371,12 @@ export function buildFileSystemBridge(
         len = length ?? bytes.length - off;
         pos = position;
       }
-      const writeAt = pos !== null && pos !== undefined ? pos : entry.cursor;
+      const append = entry.mode.includes("a");
+      const writeAt = append ? entry.data.length : pos !== null && pos !== undefined ? pos : entry.cursor;
       const endAt = writeAt + len;
-      if (endAt > entry.data.length) {
-        const expanded = new Uint8Array(endAt);
-        expanded.set(entry.data);
-        entry.data = expanded;
-      }
-      for (let i = 0; i < len; i++) entry.data[writeAt + i] = bytes[off + i];
-      if (pos === null || pos === undefined) entry.cursor = endAt;
+      extendFdData(entry, endAt);
+      copyBytes(entry.data, writeAt, bytes, off, len);
+      if (append || pos === null || pos === undefined) entry.cursor = endAt;
       return Promise.resolve({ bytesWritten: len, buffer: buf });
     }
 
@@ -1281,12 +1397,8 @@ export function buildFileSystemBridge(
       for (const buf of buffers) {
         const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
         const endAt = writePos + u8.length;
-        if (endAt > entry.data.length) {
-          const expanded = new Uint8Array(endAt);
-          expanded.set(entry.data);
-          entry.data = expanded;
-        }
-        for (let i = 0; i < u8.length; i++) entry.data[writePos + i] = u8[i];
+        extendFdData(entry, endAt);
+        copyBytes(entry.data, writePos, u8, 0, u8.length);
         writePos += u8.length;
         totalWritten += u8.length;
       }
@@ -1310,7 +1422,7 @@ export function buildFileSystemBridge(
       target: unknown,
       encOrOpts?: string | { encoding?: string | null },
     ): Promise<Buffer | string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           const p = abs(target);
           let enc: string | undefined;
@@ -1329,7 +1441,7 @@ export function buildFileSystemBridge(
       data: string | Uint8Array,
       opts?: WriteFileOptions,
     ): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           bridge.writeFileSync(target as PathArg, data, opts);
           ok();
@@ -1339,7 +1451,7 @@ export function buildFileSystemBridge(
       });
     },
     stat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(runStat(() => volume.statSync(abs(target)), opts));
         } catch (e) {
@@ -1351,7 +1463,7 @@ export function buildFileSystemBridge(
       target: unknown,
       opts?: { recursive?: boolean; mode?: number },
     ): Promise<string | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.mkdirSync(abs(target), opts));
         } catch (e) {
@@ -1360,7 +1472,7 @@ export function buildFileSystemBridge(
       });
     },
     unlink(target: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.unlinkSync(abs(target));
           ok();
@@ -1370,7 +1482,7 @@ export function buildFileSystemBridge(
       });
     },
     rmdir(target: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.rmdirSync(abs(target) as string);
           ok();
@@ -1380,7 +1492,7 @@ export function buildFileSystemBridge(
       });
     },
     rename(src: unknown, dest: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.renameSync(abs(src), abs(dest));
           ok();
@@ -1390,7 +1502,7 @@ export function buildFileSystemBridge(
       });
     },
     access(target: unknown, mode?: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.accessSync(abs(target), mode);
           ok();
@@ -1400,7 +1512,7 @@ export function buildFileSystemBridge(
       });
     },
     realpath(target: unknown): Promise<string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.realpathSync(abs(target)));
         } catch (e) {
@@ -1409,7 +1521,7 @@ export function buildFileSystemBridge(
       });
     },
     copyFile(src: unknown, dest: unknown, mode: number = 0): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.copyFileSync(abs(src), abs(dest), mode);
           ok();
@@ -1419,7 +1531,7 @@ export function buildFileSystemBridge(
       });
     },
     appendFile(target: unknown, data: string | Uint8Array): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.appendFileSync(abs(target), data);
           ok();
@@ -1429,7 +1541,7 @@ export function buildFileSystemBridge(
       });
     },
     symlink(target: unknown, path: unknown, type?: string): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
           ok();
@@ -1439,7 +1551,7 @@ export function buildFileSystemBridge(
       });
     },
     readlink(target: unknown): Promise<string> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(volume.readlinkSync(abs(target)));
         } catch (e) {
@@ -1448,7 +1560,7 @@ export function buildFileSystemBridge(
       });
     },
     link(existingPath: unknown, newPath: unknown): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.linkSync(abs(existingPath), abs(newPath));
           ok();
@@ -1458,7 +1570,7 @@ export function buildFileSystemBridge(
       });
     },
     chmod(target: unknown, mode: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.chmodSync(abs(target), mode);
           ok();
@@ -1468,7 +1580,7 @@ export function buildFileSystemBridge(
       });
     },
     chown(target: unknown, uid: number, gid: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.chownSync(abs(target), uid, gid);
           ok();
@@ -1478,7 +1590,7 @@ export function buildFileSystemBridge(
       });
     },
     truncate(target: unknown, len?: number): Promise<void> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           volume.truncateSync(abs(target), len);
           ok();
@@ -1518,7 +1630,7 @@ export function buildFileSystemBridge(
       });
     },
     lstat(target: unknown, opts?: StatOptions): Promise<FileStat | undefined> {
-      return new Promise((ok, fail) => {
+      return settledPromise((ok, fail) => {
         try {
           ok(runStat(() => volume.lstatSync(abs(target)), opts));
         } catch (e) {
@@ -1529,25 +1641,25 @@ export function buildFileSystemBridge(
     utimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
       try {
         volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     lchown(target: unknown, uid: number, gid: number): Promise<void> {
       try {
         volume.lchownSync(abs(target), uid, gid);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     lutimes(target: unknown, atime: unknown, mtime: unknown): Promise<void> {
       try {
         volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        return Promise.resolve();
+        return settledResolve();
       } catch (error) {
-        return Promise.reject(error);
+        return settledReject(error);
       }
     },
     opendir(target: unknown, _opts?: unknown): Promise<Dir> {
@@ -1555,9 +1667,9 @@ export function buildFileSystemBridge(
         const p = abs(target);
         const names = volume.readdirSync(p);
         const entries = toDirents(p, names);
-        return Promise.resolve(new Dir(p, entries));
+        return settledResolve(new Dir(p, entries));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     readdir(
@@ -1569,11 +1681,11 @@ export function buildFileSystemBridge(
         const names = volume.readdirSync(p);
         const o = typeof opts === "string" ? { encoding: opts } : opts;
         if (o?.withFileTypes) {
-          return Promise.resolve(toDirents(p, names));
+          return settledResolve(toDirents(p, names));
         }
-        return Promise.resolve(encodeReaddirNames(names, o?.encoding));
+        return settledResolve(encodeReaddirNames(names, o?.encoding));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     glob(
@@ -1587,9 +1699,9 @@ export function buildFileSystemBridge(
           return {
             next() {
               if (i < matched.length) {
-                return Promise.resolve({ value: matched[i++], done: false as const });
+                return settledResolve({ value: matched[i++], done: false as const });
               }
-              return Promise.resolve({ value: undefined as never, done: true as const });
+              return settledResolve({ value: undefined as never, done: true as const });
             },
           };
         },
@@ -1599,16 +1711,16 @@ export function buildFileSystemBridge(
       try {
         const f = flags ?? "r";
         const fd = bridge.openSync(abs(target), f, _mode);
-        return Promise.resolve(new FileHandle(fd));
+        return settledResolve(new FileHandle(fd));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     mkdtemp(prefix: string): Promise<string> {
       try {
-        return Promise.resolve(bridge.mkdtempSync(prefix));
+        return settledResolve(bridge.mkdtempSync(prefix));
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     watch(
@@ -1643,9 +1755,9 @@ export function buildFileSystemBridge(
           return {
             next(): Promise<IteratorResult<{ eventType: string; filename: string | null }>> {
               if (events.length > 0) {
-                return Promise.resolve({ value: events.shift()!, done: false });
+                return settledResolve({ value: events.shift()!, done: false });
               }
-              if (closed) return Promise.resolve({ value: undefined as any, done: true });
+              if (closed) return settledResolve({ value: undefined as any, done: true });
               return new Promise<IteratorResult<{ eventType: string; filename: string | null }>>((res) => {
                 resolve = () => {
                   if (events.length > 0) res({ value: events.shift()!, done: false });
@@ -1655,14 +1767,14 @@ export function buildFileSystemBridge(
             },
             return(): Promise<IteratorResult<{ eventType: string; filename: string | null }>> {
               releaseAll();
-              return Promise.resolve({ value: undefined as any, done: true });
+              return settledResolve({ value: undefined as any, done: true });
             },
           };
         },
       };
     },
     statfs(_target: unknown): Promise<StatFs> {
-      return Promise.resolve(new StatFs());
+      return settledResolve(new StatFs());
     },
     cp(
       src: unknown,
@@ -1671,9 +1783,9 @@ export function buildFileSystemBridge(
     ): Promise<void> {
       try {
         bridge.cpSync(src, dest, opts);
-        return Promise.resolve();
+        return settledResolve();
       } catch (e) {
-        return Promise.reject(e);
+        return settledReject(e);
       }
     },
     FileHandle: FileHandle as any,
@@ -1686,6 +1798,39 @@ export function buildFileSystemBridge(
     return volume.realpathSync(abs(target));
   };
 
+  // readFileSync's bytes as stored (not a copy: callers must not write to
+  // them), with its .wasm asset handling
+  function readStoredBytes(target: unknown): Uint8Array {
+    const p = abs(target);
+    const wasmPath =
+      p.endsWith(".wasm") && p.includes("/node_modules/")
+        ? resolveWasmAssetPath(volume, p)
+        : p;
+
+    try {
+      const raw = volume.readFileSync(wasmPath);
+      // Synchronous WASM loaders compile immediately after this read. Starting
+      // an asynchronous warm-up here retained another full binary and could
+      // compile it again before that loader's constructor reached the cache.
+      return raw;
+    } catch (err: any) {
+      // .wasm under node_modules missing from the VFS (e.g. >15MB binary
+      // that skipped extraction): kick an async CDN prefetch so a retry
+      // succeeds, but never block this thread with a sync download.
+      if (
+        err?.code === "ENOENT" &&
+        p.endsWith(".wasm") &&
+        p.includes("/node_modules/")
+      ) {
+        console.warn(
+          `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
+        );
+        prefetchWasmFromCdn(volume, wasmPath).catch(() => {});
+      }
+      throw err;
+    }
+  }
+
   const bridge: FsBridge = {
     __openFileHandleSync(target: PathArg): VolumeFileHandle {
       return volume.openFileHandleSync(abs(target));
@@ -1694,35 +1839,10 @@ export function buildFileSystemBridge(
       target: unknown,
       encOrOpts?: string | { encoding?: string | null },
     ): Buffer | string {
-      const p = abs(target);
       let enc: string | undefined;
       if (typeof encOrOpts === "string") enc = encOrOpts;
       else if (encOrOpts?.encoding) enc = encOrOpts.encoding ?? undefined;
-      const wasmPath =
-        p.endsWith(".wasm") && p.includes("/node_modules/")
-          ? resolveWasmAssetPath(volume, p)
-          : p;
-
-      try {
-        const raw = volume.readFileSync(wasmPath);
-        if (wasmPath.endsWith(".wasm")) precompileWasm(raw);
-        return decodeBytes(raw, enc);
-      } catch (err: any) {
-        // .wasm under node_modules missing from the VFS (e.g. >15MB binary
-        // that skipped extraction): kick an async CDN prefetch so a retry
-        // succeeds, but never block this thread with a sync download.
-        if (
-          err?.code === "ENOENT" &&
-          p.endsWith(".wasm") &&
-          p.includes("/node_modules/")
-        ) {
-          console.warn(
-            `[nodepod] ${p} not in VFS — fetching from CDN in the background; the next read will succeed once it lands`,
-          );
-          prefetchWasmFromCdn(volume, wasmPath).catch(() => {});
-        }
-        throw err;
-      }
+      return decodeBytes(readStoredBytes(target), enc);
     },
 
     writeFileSync(
@@ -1763,9 +1883,6 @@ export function buildFileSystemBridge(
       } finally {
         bridge.closeSync(fd);
       }
-      if (wp.endsWith(".wasm")) {
-        precompileWasm(bytes);
-      }
     },
 
     existsSync(target: unknown): boolean {
@@ -1790,7 +1907,11 @@ export function buildFileSystemBridge(
     },
 
     statSync(target: unknown, opts?: StatOptions): FileStat | undefined {
-      return runStat(() => volume.statSync(abs(target)), opts);
+      const p = abs(target);
+      // probing callers (vite's tryStatSync, resolvers) mostly miss: answer
+      // those without constructing and unwinding an ENOENT error
+      if (opts?.throwIfNoEntry === false && !volume.existsSync(p)) return undefined;
+      return runStat(() => volume.statSync(p), opts);
     },
 
     lstatSync(target: unknown, opts?: StatOptions): FileStat | undefined {
@@ -1866,9 +1987,7 @@ export function buildFileSystemBridge(
     },
 
     futimesSync(fd: number, atime: unknown, mtime: unknown): void {
-      const entry = openFiles.get(fd);
-      if (!entry) throw makeBadfError("futimes");
-      volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
+      setFdTimes(fd, atime, mtime);
     },
 
     fchownSync(fd: number, uid: number, gid: number): void {
@@ -1994,12 +2113,16 @@ export function buildFileSystemBridge(
       }
 
       const fd = fdCounter++;
+      // a read-only open reads the stored bytes in place (writes to the file
+      // replace them, never change them); writing through it copies first
+      const borrow = isReadOnly && !isWrite && exists;
       openFiles.set(fd, {
         filePath: p,
         cursor: flagStr.includes("a") ? content.length : 0,
         mode: flagStr,
-        data: new Uint8Array(content),
+        data: borrow ? content : new Uint8Array(content),
         createMode: created ? createMode : undefined,
+        borrowed: borrow ? content : undefined,
       });
       if (exists && flagStr.includes("w") && !flagStr.includes("a")) {
         // truncate on open for 'w' — deferred until first persist so fsync
@@ -2038,9 +2161,7 @@ export function buildFileSystemBridge(
       const readAt = pos !== null ? pos : entry.cursor;
       const count = Math.min(len, entry.data.length - readAt);
       if (count <= 0) return 0;
-      for (let i = 0; i < count; i++) {
-        buf[off + i] = entry.data[readAt + i];
-      }
+      copyBytes(buf, off, entry.data, readAt, count);
       if (pos === null) entry.cursor += count;
       return count;
     },
@@ -2074,20 +2195,14 @@ export function buildFileSystemBridge(
         len = len ?? bytes.length - off;
       }
 
-      const writeAt = pos !== null && pos !== undefined ? pos : entry.cursor;
+      const append = entry.mode.includes("a");
+      const writeAt = append ? entry.data.length : pos !== null && pos !== undefined ? pos : entry.cursor;
       const endAt = writeAt + len;
 
-      if (endAt > entry.data.length) {
-        const expanded = new Uint8Array(endAt);
-        expanded.set(entry.data);
-        entry.data = expanded;
-      }
+      extendFdData(entry, endAt);
+      copyBytes(entry.data, writeAt, bytes, off, len);
 
-      for (let i = 0; i < len; i++) {
-        entry.data[writeAt + i] = bytes[off + i];
-      }
-
-      if (pos === null || pos === undefined) entry.cursor = endAt;
+      if (append || pos === null || pos === undefined) entry.cursor = endAt;
       return len;
     },
 
@@ -2289,9 +2404,9 @@ export function buildFileSystemBridge(
       try {
         const raw = volume.readFileSync(p);
         const data = decodeBytes(raw, enc);
-        if (actualCb) setTimeout(() => actualCb(null, data), 0);
+        if (actualCb) deferCallback(() => actualCb(null, data));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2311,9 +2426,9 @@ export function buildFileSystemBridge(
           : undefined;
       try {
         bridge.writeFileSync(target as PathArg, data as any, opts);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2330,9 +2445,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = runStat(() => volume.statSync(abs(target)), opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2349,9 +2464,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = runStat(() => volume.lstatSync(abs(target)), opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2379,9 +2494,9 @@ export function buildFileSystemBridge(
         const files = opts?.withFileTypes
           ? toDirents(p, names)
           : encodeReaddirNames(names, opts?.encoding);
-        if (actualCb) setTimeout(() => actualCb(null, files), 0);
+        if (actualCb) deferCallback(() => actualCb(null, files));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2396,18 +2511,18 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         const created = volume.mkdirSync(abs(target), opts);
-        if (actualCb) setTimeout(() => actualCb(null, created), 0);
+        if (actualCb) deferCallback(() => actualCb(null, created));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
     unlink(target: unknown, cb?: (err: Error | null) => void): void {
       try {
         volume.unlinkSync(abs(target));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2417,18 +2532,18 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         volume.rmdirSync(abs(target));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
     rename(oldPath: unknown, newPath: unknown, cb?: (err: Error | null) => void): void {
       try {
         volume.renameSync(abs(oldPath), abs(newPath));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2462,9 +2577,9 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         volume.appendFileSync(abs(target), data);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2478,9 +2593,9 @@ export function buildFileSystemBridge(
       const type = typeof typeOrCb === "string" ? typeOrCb : undefined;
       try {
         volume.symlinkSync(symlinkTargetArg(target), abs(path), type);
-        if (actualCb) setTimeout(() => actualCb(null), 0);
+        if (actualCb) deferCallback(() => actualCb(null));
       } catch (e) {
-        if (actualCb) setTimeout(() => actualCb(e as Error), 0);
+        if (actualCb) deferCallback(() => actualCb(e as Error));
       }
     },
 
@@ -2494,9 +2609,9 @@ export function buildFileSystemBridge(
         : maybeCb;
       try {
         const result = volume.readlinkSync(abs(target));
-        if (cb) setTimeout(() => cb(null, result), 0);
+        if (cb) deferCallback(() => cb(null, result));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2507,9 +2622,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.linkSync(abs(existingPath), abs(newPath));
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2520,9 +2635,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.chmodSync(abs(target), mode as number);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2534,9 +2649,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.chownSync(abs(target), uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2548,9 +2663,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lchownSync(abs(target), uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2562,9 +2677,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.utimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2576,9 +2691,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lutimesSync(abs(target), atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
     open(
@@ -2603,18 +2718,18 @@ export function buildFileSystemBridge(
       }
       try {
         const fd = bridge.openSync(abs(target), flags, mode);
-        if (callback) setTimeout(() => callback(null, fd), 0);
+        if (callback) deferCallback(() => callback(null, fd));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
     close(fd: number, cb?: (err: Error | null) => void): void {
       try {
         bridge.closeSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2677,9 +2792,9 @@ export function buildFileSystemBridge(
 
       try {
         const n = bridge.readSync(fd, buf, off, len, pos);
-        if (callback) setTimeout(() => callback(null, n, buf), 0);
+        if (callback) deferCallback(() => callback(null, n, buf));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buf), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buf));
       }
     },
 
@@ -2717,9 +2832,9 @@ export function buildFileSystemBridge(
         callback = offsetOrCb;
         try {
           const n = bridge.writeSync(fd, buf);
-          setTimeout(() => callback(null, n, buf), 0);
+          deferCallback(() => callback(null, n, buf));
         } catch (e) {
-          setTimeout(() => callback(e as Error, 0, buf), 0);
+          deferCallback(() => callback(e as Error, 0, buf));
         }
         return;
       }
@@ -2733,9 +2848,9 @@ export function buildFileSystemBridge(
         const len = typeof lengthOrEnc === "number" ? lengthOrEnc : undefined;
         const pos = typeof positionOrCb === "number" ? positionOrCb : undefined;
         const n = bridge.writeSync(fd, buf, off, len, pos);
-        if (callback) setTimeout(() => callback(null, n, buf), 0);
+        if (callback) deferCallback(() => callback(null, n, buf));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buf), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buf));
       }
     },
 
@@ -2757,9 +2872,9 @@ export function buildFileSystemBridge(
           const n = bridge.writeSync(fd, u8 as unknown as Buffer, 0, u8.length, pos !== null ? pos + totalWritten : undefined);
           totalWritten += n;
         }
-        if (callback) setTimeout(() => callback(null, totalWritten, buffers), 0);
+        if (callback) deferCallback(() => callback(null, totalWritten, buffers));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buffers), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buffers));
       }
     },
 
@@ -2772,9 +2887,9 @@ export function buildFileSystemBridge(
         : undefined;
       try {
         const st = bridge.fstatSync(fd, opts);
-        if (cb) setTimeout(() => cb(null, st), 0);
+        if (cb) deferCallback(() => cb(null, st));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2784,16 +2899,11 @@ export function buildFileSystemBridge(
       mtime: number | string | Date,
       cb: (err: Error | null) => void,
     ): void {
-      const entry = openFiles.get(fd);
-      if (!entry) {
-        if (cb) setTimeout(() => cb(makeBadfError("futimes")), 0);
-        return;
-      }
       try {
-        volume.utimesSync(entry.filePath, atime as number | Date, mtime as number | Date);
-        if (cb) setTimeout(() => cb(null), 0);
+        setFdTimes(fd, atime, mtime);
+        if (cb) deferCallback(() => cb(null));
       } catch (error) {
-        if (cb) setTimeout(() => cb(error as Error), 0);
+        if (cb) deferCallback(() => cb(error as Error));
       }
     },
 
@@ -2805,9 +2915,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         bridge.fchownSync(fd, uid, gid);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -2818,9 +2928,9 @@ export function buildFileSystemBridge(
     ): void {
       try {
         bridge.fchmodSync(fd, mode);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
     // function constructor, not class -- graceful-fs calls fs$ReadStream.apply(this, args)
@@ -2949,152 +3059,105 @@ export function buildFileSystemBridge(
       return FsReadStream as any;
     })(),
 
-    // function constructor, not class -- graceful-fs calls fs$WriteStream.apply(this, args)
+    // Function constructor: graceful-fs calls WriteStream.apply(this, args).
     WriteStream: (() => {
-      function FsWriteStream(this: FsWriteStreamInstance, pathArg: unknown, opts?: Record<string, unknown>) {
-        if (!(this instanceof FsWriteStream)) return new (FsWriteStream as unknown as new (p: unknown, o?: Record<string, unknown>) => FsWriteStreamInstance)(pathArg, opts);
-        const self: FsWriteStreamInstance = this;
-        self._parts = [];
-        self._closed = false;
-        self._objectMode = false;
-        self._highWaterMark = 16384;
-        self._autoDestroy = true;
-        self._corked = 0;
-        self._corkedWrites = [];
-        self._writableByteLength = 0;
-        self.writable = true;
-        self.writableEnded = false;
-        self.writableFinished = false;
-        self.writableNeedDrain = false;
-        self.destroyed = false;
-        self.closed = false;
-        self.errored = null;
-        self.writableObjectMode = false;
-        self.writableHighWaterMark = 16384;
-        self.writableCorked = 0;
-        self._writableState = {
-          get objectMode() { return self._objectMode; },
-          get highWaterMark() { return self._highWaterMark; },
-          get finished() { return self.writableFinished; },
-          set finished(v: boolean) { self.writableFinished = v; },
-          get ended() { return self.writableEnded; },
-          set ended(v: boolean) { self.writableEnded = v; },
-          get destroyed() { return self.destroyed; },
-          get errored() { return self.errored; },
-          get closed() { return self.closed; },
-          get corked() { return self._corked; },
-          get length() { return self._writableByteLength; },
-          get needDrain() { return self.writableNeedDrain; },
-          writing: false,
-          errorEmitted: false,
-          emitClose: true,
-          get autoDestroy() { return self._autoDestroy; },
-          defaultEncoding: "utf8",
-          finalCalled: false,
-          ending: false,
-          bufferedIndex: 0,
-        };
+      function FsWriteStream(this: FsWriteStreamInstance, pathArg: unknown, opts?: FsWriteStreamOptions) {
+        if (!(this instanceof FsWriteStream)) return new (FsWriteStream as unknown as FsBridge["WriteStream"])(pathArg, opts);
+        const self = this;
+        Writable.call(self, { ...opts, autoDestroy: opts?.autoClose !== false });
         self.path = abs(pathArg);
-        self.fd = (opts?.fd as number | null) ?? null;
-        self.flags = (opts?.flags as string) ?? "w";
-        self.mode = (opts?.mode as number) ?? 0o666;
+        self.fd = opts?.fd ?? null;
+        self.flags = opts?.flags ?? "w";
+        self.mode = opts?.mode ?? 0o666;
         self.autoClose = opts?.autoClose !== false;
         self.bytesWritten = 0;
-        self._chunks = [] as Uint8Array[];
-        self._enc = new TextEncoder();
-        queueMicrotask(() => self.open());
+        self.pos = opts?.start;
+        queueMicrotask(() => {
+          if (self.destroyed) return;
+          if (self.fd === null) self.open();
+          else self.emit("ready");
+        });
       }
       FsWriteStream.prototype = Object.create(Writable.prototype);
       FsWriteStream.prototype.constructor = FsWriteStream;
-
-      FsWriteStream.prototype.open = function () {
+      FsWriteStream.prototype.open = function (this: FsWriteStreamInstance) {
         try {
           this.fd = bridge.openSync(this.path, this.flags, this.mode);
           this.emit("open", this.fd);
           this.emit("ready");
         } catch (err) {
-          this.destroy(err);
+          this.destroy(err as Error);
         }
       };
-
-      FsWriteStream.prototype._write = function (
-        chunk: Uint8Array | string,
-        _encoding: string,
-        callback: (err?: Error | null) => void,
-      ) {
-        const bytes =
-          typeof chunk === "string" ? this._enc.encode(chunk) : chunk;
-        this._chunks.push(bytes);
-        this.bytesWritten += bytes.length;
-        callback(null);
+      FsWriteStream.prototype._write = function (this: FsWriteStreamInstance, chunk: Uint8Array | string, encoding: string, cb: (err?: Error | null) => void) {
+        if (this.fd === null) {
+          this.once("open", () => this._write(chunk, encoding, cb));
+          return;
+        }
+        let error: Error | null = null;
+        try {
+          const bytes = typeof chunk === "string" ? normalizeWriteData(chunk, encoding) : chunk;
+          const count = bridge.writeSync(this.fd, bytes as Buffer, 0, bytes.length, this.pos ?? null);
+          this.bytesWritten += count;
+          if (this.pos !== undefined) this.pos += count;
+        } catch (err) {
+          error = err as Error;
+        }
+        // User callbacks run after write() returns and outside the I/O catch.
+        // A callback exception must never trigger a second invocation.
+        deferCallback(() => cb(error));
       };
-
-      FsWriteStream.prototype.close = function (cb?: (err?: Error | null) => void) {
-        this._flushChunks();
-        if (this.fd !== null) {
-          try {
+      FsWriteStream.prototype._final = function (this: FsWriteStreamInstance, cb: (err?: Error | null) => void) {
+        if (this.fd === null) {
+          this.once("open", () => this._final(cb));
+          return;
+        }
+        let error: Error | null = null;
+        try {
+          if (this.autoClose) {
             bridge.closeSync(this.fd);
-          } catch {}
-          this.fd = null;
+            this.fd = null;
+          } else bridge.fsyncSync(this.fd);
+        } catch (err) {
+          error = err as Error;
         }
-        this.emit("finish");
-        this.emit("close");
-        if (cb) cb(null);
+        deferCallback(() => cb(error));
       };
-
-      FsWriteStream.prototype._flushChunks = function () {
-        if (!this._chunks || this._chunks.length === 0) return;
-        if (this.fd === null) return;
-        const totalLen = this._chunks.reduce((sum: number, c: Uint8Array) => sum + c.length, 0);
-        const merged = new Uint8Array(totalLen);
-        let pos = 0;
-        for (const c of this._chunks) {
-          merged.set(c, pos);
-          pos += c.length;
-        }
-        // write into the FD buffer so closeSync persists the same bytes
-        // (bypass writeFileSync — that would be wiped by closeSync's empty FD)
-        const isAppend = typeof this.flags === "string" && this.flags.includes("a");
-        const writePos = isAppend ? null : 0;
-        if (!isAppend) {
-          bridge.ftruncateSync(this.fd, 0);
-        }
-        bridge.writeSync(this.fd, merged as unknown as Buffer, 0, merged.length, writePos);
-        this._chunks = [];
-      };
-
-      FsWriteStream.prototype.end = function (chunkOrCb?: any, encOrCb?: any, cb?: any) {
-        if (typeof chunkOrCb === "function") {
-          cb = chunkOrCb;
-          chunkOrCb = undefined;
-        } else if (typeof encOrCb === "function") {
-          cb = encOrCb;
-          encOrCb = undefined;
-        }
-        if (chunkOrCb !== undefined) {
-          const bytes =
-            typeof chunkOrCb === "string"
-              ? this._enc.encode(chunkOrCb)
-              : chunkOrCb;
-          this._chunks.push(bytes);
-          this.bytesWritten += bytes.length;
-        }
-        this._flushChunks();
-        if (this.fd !== null && this.autoClose) {
-          try {
+      FsWriteStream.prototype._destroy = function (this: FsWriteStreamInstance, err: Error | null, cb: (err?: Error | null) => void) {
+        let error = err;
+        try {
+          if (this.fd !== null && this.autoClose) {
             bridge.closeSync(this.fd);
-          } catch {}
-          this.fd = null;
+            this.fd = null;
+          }
+        } catch (closeError) {
+          error ??= closeError as Error;
         }
-        this.emit("finish");
-        this.emit("close");
-        if (cb) cb();
-        return this;
+        cb(error);
       };
-
-      return FsWriteStream as any;
+      FsWriteStream.prototype.end = function (this: FsWriteStreamInstance, chunkOrCb?: any, encOrCb?: any, cb?: () => void) {
+        if (typeof chunkOrCb === "function") cb = chunkOrCb;
+        else {
+          if (typeof encOrCb === "function") cb = encOrCb;
+          if (chunkOrCb !== undefined) this.write(chunkOrCb, typeof encOrCb === "string" ? encOrCb : undefined);
+        }
+        // end() flushes all nested corks before finalizing the descriptor.
+        while (this._corked > 0) this.uncork();
+        return Writable.prototype.end.call(this, cb);
+      };
+      FsWriteStream.prototype.close = function (this: FsWriteStreamInstance, cb?: () => void) {
+        if (cb) {
+          if (this.closed) queueMicrotask(cb);
+          else this.once("close", cb);
+        }
+        // Explicit close also owns the descriptor when autoClose was disabled.
+        this.autoClose = true;
+        this._autoDestroy = true;
+        if (!this.writableEnded) this.end();
+        else if (this.writableFinished && !this.closed) this.destroy();
+      };
+      return FsWriteStream as unknown as FsBridge["WriteStream"];
     })(),
-
     createReadStream(
       target: unknown,
       opts?: { encoding?: string; start?: number; end?: number; highWaterMark?: number; flags?: string; mode?: number; autoClose?: boolean; fd?: number },
@@ -3102,97 +3165,8 @@ export function buildFileSystemBridge(
       return new (bridge.ReadStream as any)(target, opts);
     },
 
-    createWriteStream(
-      target: unknown,
-      opts?: { encoding?: string; flags?: string },
-    ): Writable {
-      const p = abs(target);
-      const isAppend = opts?.flags === "a";
-      const chunks: Uint8Array[] = [];
-      const enc = new TextEncoder();
-      let bytesWritten = 0;
-      let closed = false;
-
-      const stream: any = new Writable();
-      stream.path = p;
-      stream.fd = null;
-      stream.open = function () {
-        stream.fd = 43;
-        stream.emit("open", stream.fd);
-      };
-      Object.defineProperty(stream, "bytesWritten", {
-        get: () => bytesWritten,
-        enumerable: true,
-      });
-      queueMicrotask(() => stream.open());
-
-      const flushAndClose = function (cb?: (err?: Error | null) => void) {
-        if (closed) {
-          if (cb) cb(null);
-          return;
-        }
-        closed = true;
-        const totalLen = chunks.reduce((sum, c) => sum + c.length, 0);
-        const merged = new Uint8Array(totalLen);
-        let pos = 0;
-        for (const c of chunks) {
-          merged.set(c, pos);
-          pos += c.length;
-        }
-
-        try {
-          if (isAppend) {
-            volume.appendFileSync(p, merged);
-          } else {
-            volume.writeFileSync(p, merged);
-          }
-        } catch (e) {
-          if (cb) cb(e as Error);
-          return;
-        }
-
-        stream.emit("finish");
-        stream.emit("close");
-        if (cb) cb(null);
-      };
-
-      stream.write = function (
-        chunk: Uint8Array | string,
-        encOrCb?: string | ((err?: Error | null) => void),
-        cb?: (err?: Error | null) => void,
-      ): boolean {
-        const bytes = typeof chunk === "string" ? enc.encode(chunk) : chunk;
-        chunks.push(bytes);
-        bytesWritten += bytes.length;
-        const callback = typeof encOrCb === "function" ? encOrCb : cb;
-        if (callback) queueMicrotask(() => callback(null));
-        return true;
-      };
-
-      stream.end = function (
-        chunkOrCb?: Uint8Array | string | (() => void),
-        encOrCb?: string | (() => void),
-        cb?: () => void,
-      ): Writable {
-        if (typeof chunkOrCb === "function") {
-          cb = chunkOrCb;
-        } else if (chunkOrCb !== undefined) {
-          const bytes =
-            typeof chunkOrCb === "string" ? enc.encode(chunkOrCb) : chunkOrCb;
-          chunks.push(bytes);
-          bytesWritten += bytes.length;
-        }
-        if (typeof encOrCb === "function") cb = encOrCb;
-
-        flushAndClose(cb as any);
-        return stream;
-      };
-
-      stream.close = function (cb?: (err?: Error | null) => void) {
-        flushAndClose(cb);
-      };
-
-      return stream;
+    createWriteStream(target: unknown, opts?: FsWriteStreamOptions): FsWriteStreamInstance {
+      return new bridge.WriteStream(target, opts);
     },
     opendirSync(target: unknown, _opts?: unknown): Dir {
       const p = abs(target);
@@ -3224,7 +3198,7 @@ export function buildFileSystemBridge(
     },
     exists(target: unknown, cb: (exists: boolean) => void): void {
       const result = volume.existsSync(abs(target));
-      setTimeout(() => cb(result), 0);
+      deferCallback(() => cb(result));
     },
     lchmodSync(target: unknown, mode: number): void {
       volume.lchmodSync(abs(target), mode);
@@ -3237,26 +3211,26 @@ export function buildFileSystemBridge(
     ): void {
       try {
         volume.lchmodSync(abs(target), mode);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
     fdatasync(fd: number, cb: (err: Error | null) => void): void {
       try {
         bridge.fdatasyncSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
     fsync(fd: number, cb: (err: Error | null) => void): void {
       try {
         bridge.fsyncSync(fd);
-        if (cb) setTimeout(() => cb(null), 0);
+        if (cb) deferCallback(() => cb(null));
       } catch (e) {
-        if (cb) setTimeout(() => cb(e as Error), 0);
+        if (cb) deferCallback(() => cb(e as Error));
       }
     },
 
@@ -3269,9 +3243,9 @@ export function buildFileSystemBridge(
       const len = typeof lenOrCb === "number" ? lenOrCb : 0;
       try {
         bridge.ftruncateSync(fd, len);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
@@ -3284,9 +3258,9 @@ export function buildFileSystemBridge(
       const len = typeof lenOrCb === "number" ? lenOrCb : 0;
       try {
         volume.truncateSync(abs(target), len);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
 
@@ -3300,9 +3274,9 @@ export function buildFileSystemBridge(
         : cb;
       try {
         const result = bridge.mkdtempSync(prefix);
-        if (callback) setTimeout(() => callback(null, result), 0);
+        if (callback) deferCallback(() => callback(null, result));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     readvSync(fd: number, buffers: ArrayBufferView[], pos?: number | null): number {
@@ -3335,9 +3309,9 @@ export function buildFileSystemBridge(
       const pos = typeof positionOrCb === "number" ? positionOrCb : null;
       try {
         const n = bridge.readvSync(fd, buffers, pos);
-        if (callback) setTimeout(() => callback(null, n, buffers), 0);
+        if (callback) deferCallback(() => callback(null, n, buffers));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error, 0, buffers), 0);
+        if (callback) deferCallback(() => callback(e as Error, 0, buffers));
       }
     },
     cpSync(
@@ -3429,9 +3403,9 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         bridge.cpSync(src, dest, opts);
-        if (callback) setTimeout(() => callback(null), 0);
+        if (callback) deferCallback(() => callback(null));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     statfsSync(_target: unknown, _opts?: unknown): StatFs {
@@ -3447,7 +3421,7 @@ export function buildFileSystemBridge(
         ? optsOrCb as (err: Error | null, stats?: StatFs) => void
         : cb;
       const result = new StatFs();
-      if (callback) setTimeout(() => callback(null, result), 0);
+      if (callback) deferCallback(() => callback(null, result));
     },
     globSync(
       pattern: string | string[],
@@ -3467,9 +3441,9 @@ export function buildFileSystemBridge(
       const opts = typeof optsOrCb === "object" ? optsOrCb : undefined;
       try {
         const result = bridge.globSync(pattern, opts);
-        if (callback) setTimeout(() => callback(null, result), 0);
+        if (callback) deferCallback(() => callback(null, result));
       } catch (e) {
-        if (callback) setTimeout(() => callback(e as Error), 0);
+        if (callback) deferCallback(() => callback(e as Error));
       }
     },
     openAsBlob(target: unknown, _opts?: { type?: string }): Promise<Blob> {
@@ -3490,7 +3464,15 @@ export function buildFileSystemBridge(
     constants: fsConst,
   } as FsBridge;
 
+  // for the main thread's fs proxy (helpers/napi-wasm-worker handleFsProxy):
+  // answers it copies straight into the shared reply buffer
+  Object.defineProperty(bridge, FS_PROXY_INTERNALS, {
+    value: { readStoredBytes },
+    enumerable: false,
+  });
+
   return bridge;
 }
+
 
 export default buildFileSystemBridge;

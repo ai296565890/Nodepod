@@ -402,6 +402,9 @@ ServerResponse.prototype.end = function end(
     // HEAD responses must not carry a body (RFC 9110)
     const isHead = this.req?.method === "HEAD";
     const finalBody = isHead ? Buffer.alloc(0) : Buffer.concat(this._chunks);
+    // a fresh buffer only the completed response holds: whoever ships the
+    // response on may hand its memory over instead of copying it
+    ownedResponseBodies.add(finalBody);
     this._completionCallback({
       statusCode: this.statusCode,
       statusMessage: this.statusMessage,
@@ -459,6 +462,14 @@ ServerResponse.prototype.redirect = function redirect(target: string | number, l
 ServerResponse.prototype.addTrailers = function addTrailers(_headers: Record<string, string>): void {
   // No-op
 };
+
+// response bodies built for a completed response and referenced nowhere else
+const ownedResponseBodies = new WeakSet<object>();
+
+/** Whether `body` is a completed response's own buffer (see end()). */
+export function isOwnedResponseBody(body: unknown): boolean {
+  return typeof body === "object" && body !== null && ownedResponseBodies.has(body);
+}
 
 ServerResponse.prototype._collectedBody = function _collectedBody(): Buffer {
   return Buffer.concat(this._chunks);
@@ -1474,6 +1485,36 @@ export function setHttpClientBridge(fn: HttpClientBridge | null): void {
   _httpClientBridge = fn;
 }
 
+export function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0";
+}
+
+/**
+ * Deliver a request to the virtual server listening on a loopback port: the
+ * one in this worker if it owns the port, otherwise the one another process
+ * registered with the main thread. Resolves `null` when nothing listens
+ * there (and no bridge exists), so callers can fall back to the network.
+ * Used by the global fetch() patch so a pod command can talk to its own
+ * dev server the way node's fetch reaches a local socket.
+ */
+export async function dispatchLocalRequest(
+  port: number,
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: Buffer,
+): Promise<CompletedResponse | null> {
+  const vServer = _registry.get(port);
+  if (vServer) return vServer.dispatchRequest(method, path, headers, body);
+  if (!_httpClientBridge) return null;
+  try {
+    return await _httpClientBridge(port, method, path, headers, body);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ECONNREFUSED") return null;
+    throw err;
+  }
+}
+
 // Agent
 
 export interface AgentConfig {
@@ -1658,6 +1699,8 @@ export default {
   setServerListenCallback,
   setServerCloseCallback,
   setHttpClientBridge,
+  dispatchLocalRequest,
+  isLoopbackHostname,
   _buildClientRequest,
   Agent,
   globalAgent,

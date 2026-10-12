@@ -4,6 +4,7 @@
 
 import { isExitSentinel } from "../helpers/event-loop";
 import { isInternalVfsPath } from "../constants/internal-vfs-paths";
+import { setImmediate, clearImmediate } from "./timers";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type EventHandler = (...args: any[]) => void;
@@ -25,9 +26,22 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
     return;
   }
 
-  // debounce per-path to avoid cascading reloads from multiple VFS writes
-  const pending = new Map<string, { event: string; timer: ReturnType<typeof setTimeout> }>();
-  const DEBOUNCE_MS = 50;
+  // coalesce per-path so the several VFS events of one logical write
+  // (truncate + write, or a batch synced from another thread in one task)
+  // emit once. A write lands within a single task, so waiting for the next
+  // task is enough; a fixed delay here was added straight onto HMR latency.
+  const pending = new Map<string, string>();
+  let scheduled: ReturnType<typeof setImmediate> | undefined;
+  const flush = () => {
+    scheduled = undefined;
+    const batch = Array.from(pending);
+    pending.clear();
+    for (const [path, event] of batch) {
+      if (event === 'change' || event === 'add' || event === 'addDir' || event === 'unlink') {
+        watcher.emit(event, path);
+      }
+    }
+  };
 
   const cleanup = vol.onGlobalChange((path: string, event: string) => {
     if (
@@ -38,30 +52,20 @@ function _bridgeVfsToWatcher(watcher: EventEmitter): void {
       return;
     }
 
-    const existing = pending.get(path);
-    if (existing) clearTimeout(existing.timer);
-
-    pending.set(path, {
-      event,
-      timer: setTimeout(() => {
-        pending.delete(path);
-        if (event === 'change') {
-          watcher.emit('change', path);
-        } else if (event === 'add') {
-          watcher.emit('add', path);
-        } else if (event === 'addDir') {
-          watcher.emit('addDir', path);
-        } else if (event === 'unlink') {
-          watcher.emit('unlink', path);
-        }
-      }, DEBOUNCE_MS),
-    });
+    pending.set(path, event);
+    // MessageChannel-backed check phase: one task for the whole batch,
+    // without the browser's background-tab timer clamp.
+    if (!scheduled) scheduled = setImmediate(flush);
   });
   const selfCleanup = () => {
     cleanup();
+    if (scheduled) clearImmediate(scheduled);
+    scheduled = undefined;
+    pending.clear();
     _vfsBridgeCleanups.delete(selfCleanup);
   };
   _vfsBridgeCleanups.add(selfCleanup);
+  watcher.once('close', selfCleanup);
 }
 
 // lazily init the listener map (handles Object.create() bypassing constructor)
@@ -122,7 +126,24 @@ export const EventEmitter = function EventEmitter(this: any) {
   }
 } as unknown as EventEmitterConstructor;
 
+// node emits 'newListener' before a listener is added and 'removeListener'
+// after one is removed, with the original function for once() wrappers.
+// libraries use them to react to subscriptions (IPC channels ref only while
+// someone listens for 'message', signal-exit, ...).
+function _announceAdd(target: any, name: string, handler: EventHandler): void {
+  if (_reg(target).has("newListener")) {
+    target.emit("newListener", name, (handler as any).listener ?? handler);
+  }
+}
+
+function _announceRemove(target: any, name: string, handler: EventHandler): void {
+  if (_reg(target).has("removeListener")) {
+    target.emit("removeListener", name, (handler as any).listener ?? handler);
+  }
+}
+
 EventEmitter.prototype.addListener = function addListener(name: string, handler: EventHandler): any {
+  _announceAdd(this, name, handler);
   const slot = _ensureSlot(this, name);
   slot.push(handler);
 
@@ -148,6 +169,7 @@ EventEmitter.prototype.once = function once(name: string, handler: EventHandler)
   // Node exposes the original on wrapper.listener so removeListener(original) works
   (wrapper as any).listener = handler;
   // use _ensureSlot directly, not addListener, to avoid recursion
+  _announceAdd(this, name, wrapper);
   const slot = _ensureSlot(this, name);
   slot.push(wrapper);
   return this;
@@ -164,7 +186,8 @@ EventEmitter.prototype.removeListener = function removeListener(name: string, ha
       );
     }
     if (pos !== -1) {
-      slot.splice(pos, 1);
+      const [removed] = slot.splice(pos, 1);
+      _announceRemove(this, name, removed);
     }
   }
   return this;
@@ -173,10 +196,22 @@ EventEmitter.prototype.removeListener = function removeListener(name: string, ha
 EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
 
 EventEmitter.prototype.removeAllListeners = function removeAllListeners(name?: string): any {
-  if (name !== undefined) {
-    _reg(this).delete(name);
-  } else {
-    _reg(this).clear();
+  const reg = _reg(this);
+  if (!reg.has("removeListener")) {
+    if (name !== undefined) reg.delete(name);
+    else reg.clear();
+    return this;
+  }
+  // announce each removal, newest first, like node; 'removeListener'
+  // listeners go last so they hear about everything else
+  const names = name !== undefined
+    ? [name]
+    : [...reg.keys()].filter((n) => n !== "removeListener").concat("removeListener");
+  for (const n of names) {
+    const slot = reg.get(n);
+    if (!slot) continue;
+    for (let i = slot.length - 1; i >= 0; i--) this.removeListener(n, slot[i]);
+    reg.delete(n);
   }
   return this;
 };
@@ -255,6 +290,7 @@ EventEmitter.prototype.getMaxListeners = function getMaxListeners(): number {
 };
 
 EventEmitter.prototype.prependListener = function prependListener(name: string, handler: EventHandler): any {
+  _announceAdd(this, name, handler);
   const slot = _ensureSlot(this, name);
   slot.unshift(handler);
   return this;

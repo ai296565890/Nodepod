@@ -6,9 +6,11 @@ import type { ShellResult, ShellContext } from "../shell/shell-types";
 import { EventEmitter } from "./events";
 import { Readable, Writable } from "./stream";
 import { Buffer } from "./buffer";
+import { serializeIpcMessage, type IpcSerialization } from "../helpers/ipc-serialization";
 import type { MemoryVolume } from "../memory-volume";
 import { ScriptEngine } from "../script-engine";
 import { getWorkerTransformCache } from "../threading/worker-transform-cache";
+import { prewarmEsbuild } from "../helpers/esbuild-engine";
 import type { PackageManifest } from "../types/manifest";
 import { resetActiveInterfaceCount } from "./readline";
 import {
@@ -27,13 +29,17 @@ import { createYarnCommand } from "../shell/commands/yarn";
 import { createBunCommand, createBunxCommand } from "../shell/commands/bun";
 import { createNodeCommand, createNpxCommand } from "../shell/commands/node";
 import { createGitCommand } from "../shell/commands/git";
-import { format as utilFormat } from "./util";
+import { format as utilFormat, stripVTControlCharacters } from "./util";
 import { VERSIONS, NPM_REGISTRY_URL_SLASH, DEFAULT_ENV, MOCK_PID } from "../constants/config";
 import { closeAllServers, getAllServers } from "./http";
 import { disposeAllTimers } from "./timers";
 import type { SyncChannelWorker } from "../threading/sync-channel";
 import {
-  rejectGlobal,
+  hasGlobalFlag,
+  withoutGlobalFlags,
+  globalContext,
+  linkGlobalBins,
+  unlinkGlobalBins,
   npmConfig as pmNpmConfig,
   npmPkg as pmNpmPkg,
   npmPack as pmNpmPack,
@@ -65,6 +71,9 @@ let _sabEnabled = true;
 let _stdoutSink: ((text: string) => void) | null = null;
 let _stderrSink: ((text: string) => void) | null = null;
 let _haltSignal: AbortSignal | null = null;
+// a process whose parent pipes its output has no terminal: no spinners,
+// and process.stdout.isTTY stays false, as in node
+let _stdoutIsTTY = true;
 
 let _termCols: (() => number) | null = null;
 let _termRows: (() => number) | null = null;
@@ -141,7 +150,10 @@ export function setStreamingCallbacks(cfg: {
   getCols?: () => number;
   getRows?: () => number;
   onRawModeChange?: (isRaw: boolean) => void;
+  // false when the parent reads stdout through a pipe (not a terminal)
+  isTTY?: boolean;
 }): void {
+  _stdoutIsTTY = cfg.isTTY ?? true;
   _stdoutSink = cfg.onStdout ?? null;
   _stderrSink = cfg.onStderr ?? null;
   _haltSignal = cfg.signal ?? null;
@@ -165,6 +177,7 @@ export function setStreamingCallbacks(cfg: {
 }
 
 export function clearStreamingCallbacks(): void {
+  _stdoutIsTTY = true;
   _stdoutSink = null;
   _stderrSink = null;
   _haltSignal = null;
@@ -204,7 +217,7 @@ export type SpawnChildCallback = (
   opts?: {
     cwd?: string;
     env?: Record<string, string>;
-    stdio?: "pipe" | "inherit";
+    stdio?: "pipe" | "inherit" | Array<"pipe" | "inherit" | "ignore">;
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
     onModuleLoad?: (path: string) => void;
@@ -224,9 +237,12 @@ export type ForkChildCallback = (
   opts: {
     cwd: string;
     env: Record<string, string>;
+    serialization?: import("../helpers/ipc-serialization").IpcSerialization;
+    execArgv?: string[];
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
     onIPC?: (data: unknown) => void;
+    onDisconnect?: () => void;
     onExit?: (exitCode: number) => void;
   },
 ) => {
@@ -245,11 +261,20 @@ export function setForkChildCallback(fn: ForkChildCallback): void {
 // IPC plumbing for when this worker IS a forked child
 let _ipcSendFn: ((data: unknown) => void) | null = null;
 let _ipcReceiveHandler: ((data: unknown) => void) | null = null;
+let _ipcDisconnectSend: (() => void) | null = null;
+let _ipcDisconnectHandler: (() => void) | null = null;
+let _pendingIPCDisconnect = false;
 // messages that arrive before the handler is wired (parent sends before child's ENB sets up the handler)
 let _ipcQueue: unknown[] = [];
 
-export function setIPCSend(fn: (data: unknown) => void): void {
-  _ipcSendFn = fn;
+export function setIPCSend(fn: (data: unknown) => void, serialization: IpcSerialization = "json", onDisconnect?: () => void): void {
+  _ipcSendFn = (message) => fn(serializeIpcMessage(message, serialization));
+  _ipcDisconnectSend = onDisconnect ?? null;
+}
+
+export function handleIPCDisconnect(): void {
+  if (_ipcDisconnectHandler) _ipcDisconnectHandler();
+  else _pendingIPCDisconnect = true;
 }
 
 export function setIPCReceiveHandler(fn: (data: unknown) => void): void {
@@ -381,7 +406,6 @@ export function initShellExec(volume: MemoryVolume, opts?: { cwd?: string; env?:
     hasFile: (p) => !!_vol && _vol.existsSync(p),
     readFile: (p) => _vol!.readFileSync(p, "utf8") as string,
     writeFile: (p, data) => _vol!.writeFileSync(p, data),
-    rejectGlobal,
   };
 
   _shell.registerCommand(createNodeCommand(pmDeps));
@@ -646,13 +670,23 @@ async function executeShellNodeBinary(
   }
 }
 
+// `node -e` sources are staged as a root-level file so the child worker that
+// runs them can see it through the VFS sync. The name marks it as an [eval]
+// module: executeNodeBinary resolves its relative imports from the cwd rather
+// than from `/`, matching node.
+const EVAL_SCRIPT_PREFIX = "/<eval-";
+
+function isEvalScriptPath(path: string): boolean {
+  return path.startsWith(EVAL_SCRIPT_PREFIX) && path.lastIndexOf("/") === 0;
+}
+
 function evalNodeCode(
   code: string,
   ctx: ShellContext,
   executor: typeof executeNodeBinary = executeNodeBinary,
 ): Promise<ShellResult> {
   if (!_vol) return Promise.resolve({ stdout: "", stderr: "Volume unavailable\n", exitCode: 1 });
-  const evalPath = `/<eval-${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
+  const evalPath = `${EVAL_SCRIPT_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}>.js`;
   _vol.writeFileSync(evalPath, code);
   return executor(evalPath, [], ctx).finally(() => {
     try {
@@ -723,11 +757,23 @@ function loadManifest(
   }
 }
 
+// npm/pnpm/yarn/bun accept -s/--silent on run-script to drop the
+// "> name@version script" banners (npm: loglevel silent).
+function isSilentFlag(arg: string): boolean {
+  return arg === "-s" || arg === "--silent";
+}
+
 async function runScript(
   args: string[],
   ctx: ShellContext,
 ): Promise<ShellResult> {
-  const name = args[0];
+  // extra arguments after "--" separator (npm run dev -- --webpack) belong
+  // to the script and are never interpreted here.
+  const dashIdx = args.indexOf("--");
+  const ownArgs = dashIdx >= 0 ? args.slice(0, dashIdx) : args;
+  const extraArgs = dashIdx >= 0 ? args.slice(dashIdx + 1) : [];
+  const silent = ownArgs.some(isSilentFlag);
+  const name = ownArgs.find((a) => !isSilentFlag(a));
   if (!name) {
     const r = loadManifest(ctx.cwd);
     if ("fail" in r) return r.fail;
@@ -738,10 +784,6 @@ async function runScript(
     for (const k of keys) text += `  ${k}\n    ${scripts[k]}\n`;
     return { stdout: text, stderr: "", exitCode: 0 };
   }
-
-  // extra arguments after "--" separator (npm run dev -- --webpack)
-  const dashIdx = args.indexOf("--");
-  const extraArgs = dashIdx >= 0 ? args.slice(dashIdx + 1) : [];
 
   const r = loadManifest(ctx.cwd);
   if ("fail" in r) return r.fail;
@@ -782,12 +824,17 @@ async function runScript(
   let allOut = "";
   let allErr = "";
   const label = `${r.pkg.name ?? ""}@${r.pkg.version ?? ""}`;
+  // banners go to stdout like real npm (output.standard), so a caller
+  // capturing `npm run x` sees the same lines it would from node.
+  const banner = (hdr: string) => {
+    if (silent) return;
+    allOut += hdr;
+    getStdoutSink()?.(hdr);
+  };
 
   const pre = scripts[`pre${name}`];
   if (pre) {
-    const hdr = `\n> ${label} pre${name}\n> ${pre}\n\n`;
-    allErr += hdr;
-    if (_stderrSink) _stderrSink(hdr);
+    banner(`\n> ${label} pre${name}\n> ${pre}\n\n`);
     const pr = await ctx.exec(pre, { cwd: ctx.cwd, env });
     allOut += pr.stdout;
     allErr += pr.stderr;
@@ -795,9 +842,7 @@ async function runScript(
       return { stdout: allOut, stderr: allErr, exitCode: pr.exitCode };
   }
 
-  const mainHdr = `\n> ${label} ${name}\n> ${cmd}\n\n`;
-  allErr += mainHdr;
-  if (_stderrSink) _stderrSink(mainHdr);
+  banner(`\n> ${label} ${name}\n> ${cmd}\n\n`);
   const mr = await ctx.exec(cmd, { cwd: ctx.cwd, env });
   allOut += mr.stdout;
   allErr += mr.stderr;
@@ -806,9 +851,7 @@ async function runScript(
 
   const post = scripts[`post${name}`];
   if (post) {
-    const hdr = `\n> ${label} post${name}\n> ${post}\n\n`;
-    allErr += hdr;
-    if (_stderrSink) _stderrSink(hdr);
+    banner(`\n> ${label} post${name}\n> ${post}\n\n`);
     const po = await ctx.exec(post, { cwd: ctx.cwd, env });
     allOut += po.stdout;
     allErr += po.stderr;
@@ -836,6 +879,19 @@ const ERASE_LINE = "\x1b[2K";
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 function createSpinner(text: string, writeFn: (s: string) => void) {
+  // output read through a pipe: like npm there, just the outcome as plain text
+  if (!_stdoutIsTTY) {
+    return {
+      update(_t: string) {},
+      succeed(t: string) {
+        writeFn(stripVTControlCharacters(t) + "\n");
+      },
+      fail(t: string) {
+        writeFn(stripVTControlCharacters(t) + "\n");
+      },
+      stop() {},
+    };
+  }
   let frame = 0;
   let current = text;
   const id = setInterval(() => {
@@ -950,6 +1006,11 @@ let _shellSnapshotCache:
   | null
   | undefined;
 
+// set in process workers whose main thread saves install packs itself
+function packSaveHandoff(): ((key: string) => boolean) | null {
+  return (globalThis as { __nodepodDeferPackSave?: (key: string) => boolean }).__nodepodDeferPackSave ?? null;
+}
+
 async function getShellSnapshotCache() {
   if (_shellSnapshotCache === undefined) {
     try {
@@ -987,6 +1048,18 @@ export function shellQuote(arg: string): string {
 export function shellCommandFromArgv(command: string, args: string[]): string {
   if (!args.length) return shellQuote(command);
   return `${shellQuote(command)} ${args.map(shellQuote).join(" ")}`;
+}
+
+// spawn's `shell` option, as node does it on POSIX: the command and its args
+// joined into one line that `<shell> -c` parses (zx runs every $`...` so)
+function applyShellOption(
+  command: string,
+  args: string[],
+  shell: SpawnConfig["shell"],
+): [string, string[]] {
+  if (!shell) return [command, args];
+  const line = [command, ...args].join(" ");
+  return [typeof shell === "string" ? shell : "/bin/sh", ["-c", line]];
 }
 
 /** Parent env for spawn when options.env is omitted (Node parity). */
@@ -1032,12 +1105,11 @@ async function installPackages(
   pm: PkgManager = "npm",
   opts?: { persist?: boolean },
 ): Promise<ShellResult> {
-  const globalReject = rejectGlobal(args, pm);
-  if (globalReject) return globalReject;
+  if (hasGlobalFlag(args)) return installGlobal(withoutGlobalFlags(args), ctx, pm, opts);
 
   const { DependencyInstaller } = await import("../packages/installer");
   const snapshotCache = await getShellSnapshotCache();
-  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache });
+  const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd, snapshotCache, deferPackSave: packSaveHandoff() });
   let out = "";
   const write = _stdoutSink ?? ((_s: string) => {});
   const startTime = Date.now();
@@ -1114,11 +1186,43 @@ async function installPackages(
   }
 }
 
+// npm i -g: install into the global tree, then link the named packages'
+// commands onto PATH
+async function installGlobal(
+  args: string[],
+  ctx: ShellContext,
+  pm: PkgManager,
+  opts?: { persist?: boolean },
+): Promise<ShellResult> {
+  const names = installPackageNames(args).map(specPackageName);
+  if (names.length === 0) {
+    return { stdout: "", stderr: formatErr("-g needs a package name", pm), exitCode: 1 };
+  }
+  const result = await installPackages(args, globalContext(_vol!, ctx), pm, opts);
+  if (result.exitCode !== 0) return result;
+  let out = result.stdout;
+  for (const name of names) {
+    for (const cmd of linkGlobalBins(_vol!, name)) out += `linked ${cmd} -> ${name}\n`;
+  }
+  return { ...result, stdout: out };
+}
+
+// package name from an install spec: "pkg@^1", "@scope/pkg@1", "alias@npm:real@1"
+function specPackageName(spec: string): string {
+  const at = spec.indexOf("@", spec.startsWith("@") ? 1 : 0);
+  return at > 0 ? spec.slice(0, at) : spec;
+}
+
 async function uninstallPackages(
   args: string[],
   ctx: ShellContext,
   pm: PkgManager = "npm",
 ): Promise<ShellResult> {
+  if (hasGlobalFlag(args)) {
+    const names = args.filter((a) => !a.startsWith("-"));
+    for (const name of names) unlinkGlobalBins(_vol!, name);
+    return uninstallPackages(withoutGlobalFlags(args), globalContext(_vol!, ctx), pm);
+  }
   const names = args.filter((a) => !a.startsWith("-"));
   if (names.length === 0)
     return {
@@ -1181,7 +1285,9 @@ async function uninstallPackages(
 async function listPackages(
   ctx: ShellContext,
   pm: PkgManager = "npm",
+  args: string[] = [],
 ): Promise<ShellResult> {
+  if (hasGlobalFlag(args)) ctx = globalContext(_vol!, ctx);
   const { DependencyInstaller } = await import("../packages/installer");
   const installer = new DependencyInstaller(_vol!, { cwd: ctx.cwd });
   const pkgs = installer.listInstalled();
@@ -1236,7 +1342,13 @@ async function npmInitOrCreate(
 
   // npm create <pkg> / npm init <pkg> → npx create-<pkg>
   if (sub === "create" || (sub === "init" && positional.length > 0)) {
-    const initializer = positional[0];
+    const at = args.findIndex((a) => !a.startsWith("-"));
+    const initializer = args[at]!;
+    // what follows the initializer is its own, in the order given (npm
+    // create vite app -- --template react): only npm's `--` is dropped
+    const rest = args.slice(at + 1);
+    const separator = rest.indexOf("--");
+    const initializerArgs = separator >= 0 ? [...rest.slice(0, separator), ...rest.slice(separator + 1)] : rest;
     let pkgSpec: string;
     if (initializer.startsWith("@")) {
       // scoped: npm create @scope/pkg → npx @scope/create-pkg
@@ -1252,7 +1364,7 @@ async function npmInitOrCreate(
         pkgSpec = `create-${initializer}`;
       }
     }
-    return npxExecute(["-y", pkgSpec, ...positional.slice(1), ...flags], ctx);
+    return npxExecute(["-y", pkgSpec, "--", ...initializerArgs], ctx);
   }
 
   // plain npm init [-y] → create package.json
@@ -1381,6 +1493,7 @@ async function npmCi(
   const installer = new DependencyInstaller(_vol!, {
     cwd: ctx.cwd,
     snapshotCache,
+    deferPackSave: packSaveHandoff(),
   });
   const registryUrl = resolveRegistry(_vol!, ctx.cwd, ctx.env);
   let out = "";
@@ -1421,6 +1534,7 @@ async function npmCi(
 
 export interface ExecuteNodeBinaryOptions {
   isFork?: boolean;
+  execArgv?: string[];
   workerThreadsOverride?: {
     isMainThread: boolean;
     parentPort: unknown;
@@ -1429,6 +1543,40 @@ export interface ExecuteNodeBinaryOptions {
   };
   onModuleLoad?: (path: string) => void;
   watch?: NodeWatchOptions;
+}
+
+// The tool package owning an entry script depends on esbuild (vite, tsx,
+// tsup, vitest, ...): it will call esbuild early, so start esbuild-wasm on
+// its own thread while the package's modules load rather than after. Only
+// installed tools: a project's own script (`node server.js`) may never call
+// esbuild, and an idle instance costs tens of MB.
+function prewarmEsbuildFor(entry: string): void {
+  if (!_vol || (globalThis as { __nodepodEsbuild?: unknown }).__nodepodEsbuild) return;
+  if (!entry.includes("/node_modules/")) return;
+  let dir = entry.slice(0, entry.lastIndexOf("/")) || "/";
+  for (let depth = 0; depth < 6 && dir && dir !== "/"; depth++) {
+    const manifestPath = dir + "/package.json";
+    if (_vol.existsSync(manifestPath)) {
+      try {
+        const mf = JSON.parse(_vol.readFileSync(manifestPath, "utf8")) as PackageManifest & {
+          optionalDependencies?: Record<string, string>;
+          peerDependencies?: Record<string, string>;
+          peerDependenciesMeta?: Record<string, { optional?: boolean }>;
+        };
+        // an optional peer is only used if the project brings it (vite 8
+        // lists esbuild so, and transforms with oxc): no instance for that
+        const required = (name: string): boolean =>
+          name in (mf.dependencies ?? {}) ||
+          name in (mf.optionalDependencies ?? {}) ||
+          (name in (mf.peerDependencies ?? {}) && !mf.peerDependenciesMeta?.[name]?.optional);
+        if (required("esbuild") || required("esbuild-wasm")) prewarmEsbuild();
+      } catch {
+        /* unreadable manifest: nothing to prewarm */
+      }
+      return;
+    }
+    dir = dir.slice(0, dir.lastIndexOf("/")) || "/";
+  }
 }
 
 export async function executeNodeBinary(
@@ -1471,6 +1619,8 @@ export async function executeNodeBinary(
       exitCode: 1,
     };
   }
+
+  prewarmEsbuildFor(resolved);
 
   let out = "";
   let err = "";
@@ -1562,7 +1712,7 @@ export async function executeNodeBinary(
         if (typeof a === "string" && a.startsWith("Error: Process exited with code")) return;
       }
       // error/warn → stderr, everything else → stdout
-      const line = utilFormat(cArgs[0], ...cArgs.slice(1)) + "\n";
+      const line = utilFormat(...cArgs) + "\n";
       m === "error" ? pushErr(line) : pushOut(line);
     },
     onStdout: pushOut,
@@ -1604,11 +1754,12 @@ export async function executeNodeBinary(
   }) as (c?: number) => never;
 
   proc.argv = ["node", resolved, ...args];
+  proc.execArgv = opts?.execArgv?.slice() ?? [];
 
   // wire IPC for forked children
   if (_ipcSendFn) {
     proc.send = ((msg: unknown, _cb?: (e: Error | null) => void): boolean => {
-      if (_ipcSendFn) {
+      if (_ipcSendFn && proc.connected) {
         _ipcSendFn(msg);
         if (typeof _cb === "function") _cb(null);
         return true;
@@ -1617,13 +1768,31 @@ export async function executeNodeBinary(
     }) as any;
     proc.connected = true;
     proc.disconnect = (() => {
+      if (!proc.connected) return;
       proc.connected = false;
+      _ipcDisconnectSend?.();
     }) as () => void;
 
-    // incoming IPC from parent → emit on process (also replays queued messages)
-    setIPCReceiveHandler((data: unknown) => {
-      proc.emit("message", data);
-    });
+    // incoming IPC from parent → emit on process (also replays queued messages).
+    // a worker thread's parent messages belong to its parentPort, whose
+    // receiver the worker entry already installed: keep that one.
+    if (!opts?.workerThreadsOverride) {
+      const pendingMessages: unknown[] = [];
+      const flushMessages = () => {
+        if (proc.listenerCount("message") === 0) return;
+        for (const message of pendingMessages.splice(0)) proc.emit("message", message);
+      };
+      // The transport can deliver a parent's first message before the child
+      // has evaluated its entry module. Installing the internal receiver is
+      // not enough: preserve it until user code subscribes, as Node does.
+      proc.on("newListener", (event: unknown) => {
+        if (event === "message") queueMicrotask(flushMessages);
+      });
+      setIPCReceiveHandler((data: unknown) => {
+        pendingMessages.push(data);
+        flushMessages();
+      });
+    }
   }
 
   const prevLiveStdin = _liveStdin;
@@ -1631,16 +1800,19 @@ export async function executeNodeBinary(
   // while this ENB's wait loop may still be running
   const myHaltSignal = getHaltSignal();
   if (myHaltSignal) {
-    proc.stdout.isTTY = true;
-    proc.stderr.isTTY = true;
-    proc.stdin.isTTY = true;
-    // sync terminal dimensions for TUI libraries
-    const cols = getTermCols();
-    const rows = getTermRows();
-    proc.stdout.columns = cols;
-    proc.stdout.rows = rows;
-    proc.stderr.columns = cols;
-    proc.stderr.rows = rows;
+    // a parent reading this process's output through a pipe: no terminal
+    if (_stdoutIsTTY) {
+      proc.stdout.isTTY = true;
+      proc.stderr.isTTY = true;
+      proc.stdin.isTTY = true;
+      // sync terminal dimensions for TUI libraries
+      const cols = getTermCols();
+      const rows = getTermRows();
+      proc.stdout.columns = cols;
+      proc.stdout.rows = rows;
+      proc.stderr.columns = cols;
+      proc.stderr.rows = rows;
+    }
     // stdin intentionally skipped -- real Node's tty.ReadStream has no
     // columns/rows/resize, TUIs watch process.stdout for dimensions
     proc.stdin.setRawMode = (flag: boolean) => {
@@ -1659,19 +1831,42 @@ export async function executeNodeBinary(
     _activeProcs.add(proc as any);
   }
 
-  // forked children keep an IPCChannel handle for the whole fork lifetime,
-  // released on disconnect or exit. "IPCChannel" matches what real node
-  // reports from process.getActiveResourcesInfo() for fork IPC channels.
+  // forked children hold an IPCChannel handle until disconnect or exit.
+  // "IPCChannel" matches what real node reports from
+  // process.getActiveResourcesInfo(). like node, the channel only keeps the
+  // child alive while it listens for 'message' or 'disconnect': a child
+  // that never does exits once its own work is done.
   const isFork = !!opts?.isFork;
   let ipcHandle: Handle | null = null;
   if (isFork) {
-    ipcHandle = getRegistry().register("IPCChannel");
+    ipcHandle = getRegistry().register("IPCChannel", { refed: false });
+    const isChannelEvent = (evt: unknown) => evt === "message" || evt === "disconnect";
+    // newListener fires before the listener is added
+    proc.on("newListener", (evt: unknown) => {
+      if (isChannelEvent(evt)) ipcHandle?.ref();
+    });
+    proc.on("removeListener", (evt: unknown) => {
+      if (isChannelEvent(evt) && proc.listenerCount("message") + proc.listenerCount("disconnect") === 0) {
+        ipcHandle?.unref();
+      }
+    });
     const origDisconnect = proc.disconnect;
-    proc.disconnect = (() => {
-      origDisconnect?.call(proc);
+    const closeChannel = (notifyParent: boolean) => {
+      if (!proc.connected) return;
+      if (notifyParent) origDisconnect?.call(proc);
+      else proc.connected = false;
       ipcHandle?.close();
       ipcHandle = null;
+      queueMicrotask(() => proc.emit("disconnect"));
+    };
+    proc.disconnect = (() => {
+      closeChannel(true);
     }) as () => void;
+    _ipcDisconnectHandler = () => closeChannel(false);
+    if (_pendingIPCDisconnect) {
+      _pendingIPCDisconnect = false;
+      queueMicrotask(_ipcDisconnectHandler);
+    }
   }
 
   let scriptError: Error | null = null;
@@ -1681,7 +1876,10 @@ export async function executeNodeBinary(
   const tlaDonePromise = new Promise<void>((r) => { tlaResolve = r; });
 
   try {
-    const tlaPromise = sandbox.runFileTLA(resolved);
+    const tlaPromise = sandbox.runFileTLA(
+      resolved,
+      isEvalScriptPath(resolved) ? { resolveDir: ctx.cwd } : undefined,
+    );
     tlaPromise
       .catch((e) => {
         if (isExitSentinel(e)) {
@@ -1811,6 +2009,22 @@ export async function executeNodeBinary(
   // avoid duplicate output when same error fires as both 'error' and 'unhandledrejection'
   const handledErrors = new WeakSet<object>();
 
+  // node ends the process with code 1 on an unhandled rejection or uncaught
+  // exception nobody listens for. keep the one exception proc.exit() already
+  // makes: a live dev server keeps serving and only records the code, so a
+  // plugin's stray rejection doesn't take the preview down.
+  const fatalError = () => {
+    if (getAllServers().size > 0) {
+      if (typeof (proc as any).exitCode !== "number") proc.exitCode = 1;
+      return;
+    }
+    if (didExit) return;
+    didExit = true;
+    code = 1;
+    try { proc.emit("exit", 1); } catch { /* ignore */ }
+    exitResolve();
+  };
+
   const rejHandler = (ev: PromiseRejectionEvent) => {
     ev.preventDefault();
     const r = ev.reason;
@@ -1830,6 +2044,7 @@ export async function executeNodeBinary(
       ? `Unhandled rejection: ${r.message}\n${r.stack ?? ""}\n`
       : `Unhandled rejection: ${String(r)}\n`;
     pushErr(rejMsg);
+    fatalError();
   };
   const errHandler = (ev: ErrorEvent) => {
     ev.preventDefault();
@@ -1859,6 +2074,7 @@ export async function executeNodeBinary(
       ? `${e.stack || e.message}\n`
       : `Uncaught: ${String(e)}\n`;
     pushErr(msg);
+    fatalError();
   };
   // browser and Worker globalThis has addEventListener, node-test doesn't.
   const hasGlobalEvents = typeof (globalThis as any).addEventListener === "function";
@@ -1891,12 +2107,20 @@ export async function executeNodeBinary(
     while (!didExit && !executionSignal.aborted) {
       // TLA still pending, wait for it (or drain/halt/exit).
       if (!tlaSettled) {
-        const racers: Promise<unknown>[] = [
-          tlaDonePromise,
-          registry.drainPromise(),
-          exitPromise,
-        ];
+        const racers: Promise<unknown>[] = [tlaDonePromise, exitPromise];
         if (haltPromise) racers.push(haltPromise);
+        if (registry.activeRefedCount() > 0) {
+          racers.push(registry.drainPromise());
+        } else {
+          // nothing tracked is refed but the TLA is still pending on a
+          // promise we can't see (Blob/Response body reads, fetch bodies,
+          // WebAssembly compiles, ...). those settle from browser tasks, so
+          // yield a real macrotask before re-checking. drainPromise() is
+          // already resolved here, and racing it would spin this loop on
+          // microtasks forever, starving every task in the worker: body
+          // reads never complete and the kill/abort message is never seen.
+          racers.push(new Promise<void>((r) => _nativeSetTimeout(r, 4)));
+        }
         await Promise.race(racers);
         continue;
       }
@@ -1983,12 +2207,14 @@ async function npxExecute(
   let separatorSeen = false;
 
   for (let i = 0; i < params.length; i++) {
-    if (separatorSeen) {
-      filteredParams.push(params[i]);
+    // npm's option parser takes the first `--` for itself
+    if (params[i] === "--" && !separatorSeen) {
+      separatorSeen = true;
       continue;
     }
-    if (params[i] === "--") {
-      separatorSeen = true;
+    // from the command on, every argument is the command's own
+    if (separatorSeen || filteredParams.length > 0) {
+      filteredParams.push(params[i]);
       continue;
     }
     if (params[i] === "-y" || params[i] === "--yes") {
@@ -2150,6 +2376,8 @@ export interface RunOptions {
   timeout?: number;
   maxBuffer?: number;
   shell?: string | boolean;
+  /** execSync / execFileSync only */
+  stdio?: "pipe" | "inherit" | "ignore" | Array<"pipe" | "inherit" | "ignore">;
 }
 
 export type RunCallback = (
@@ -2202,8 +2430,8 @@ export function exec(
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = exitCode;
-      child.emit("close", exitCode, null);
       child.emit("exit", exitCode, null);
+      child.emit("close", exitCode, null);
       if (done) {
         if (exitCode !== 0) {
           const e = new Error(`Command failed: ${command}`);
@@ -2221,6 +2449,13 @@ export function exec(
   );
 
   return child;
+}
+
+// node's execSync/execFileSync capture stdout and pass stderr through to
+// the parent. stdin stays shared with the terminal here: a piped stdin that
+// is never written would leave a child reading it waiting forever
+function execSyncStdio(stdio: unknown): Array<"pipe" | "inherit" | "ignore"> {
+  return stdio == null ? ["inherit", "pipe", "inherit"] : normalizeStdio(stdio as SpawnConfig["stdio"]);
 }
 
 function throwExecSyncFailed(cmd: string, status: number, stdout: string, stderr = ""): never {
@@ -2267,25 +2502,28 @@ export function execSync(cmd: string, opts?: RunOptions): string | Buffer {
     env,
     syncSlot: slot,
     shellCommand: trimmed,
+    stdio: execSyncStdio(opts?.stdio),
   });
 
   // blocks until main thread spawns child and child completes
-  const { exitCode, stdout } = _syncChannel.waitForResult(slot, 120_000);
+  const { exitCode, stdout, stderr } = _syncChannel.waitForResult(
+    slot,
+    120_000,
+    () => requestMoreSyncOutput(slot),
+  );
 
-  if (exitCode !== 0) {
-    const err: any = new Error(`Command failed: ${trimmed}\n${stdout}`);
-    err.status = exitCode;
-    err.stderr = Buffer.from("");
-    err.stdout = Buffer.from(stdout);
-    err.output = [null, err.stdout, err.stderr];
-    throw err;
-  }
+  if (exitCode !== 0) throwExecSyncFailed(trimmed, exitCode, stdout, stderr);
 
   if (encoding === "buffer") return Buffer.from(stdout);
   return stdout;
 }
 
 let _nextSyncRequestId = 1;
+
+// a sync result bigger than one slot arrives in chunks; ask for the next one
+function requestMoreSyncOutput(syncSlot: number): void {
+  (self as any).postMessage({ type: "sync-more", syncSlot });
+}
 
 const KNOWN_BINS: Record<string, string> = {
   node: "/usr/local/bin/node",
@@ -2328,17 +2566,6 @@ function isBinaryAvailable(name: string): string | null {
     if (_vol.existsSync(binPath)) return binPath;
   }
   return null;
-}
-
-// throw an error matching real Node.js execSync behaviour for failed commands
-function throwCommandNotFound(cmd: string): never {
-  const err: any = new Error(
-    `Command failed: ${cmd}\n/bin/sh: 1: ${cmd.split(/\s+/)[0]}: not found\n`,
-  );
-  err.status = 127;
-  err.stderr = Buffer.from(`/bin/sh: 1: ${cmd.split(/\s+/)[0]}: not found\n`);
-  err.stdout = Buffer.from("");
-  throw err;
 }
 
 function _findGitDir(cwd: string): { gitDir: string; workDir: string } | null {
@@ -2436,7 +2663,7 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | 
     const binName = whichMatch[1];
     const binPath = isBinaryAvailable(binName);
     if (binPath) return syncOk(binPath + "\n");
-    throwCommandNotFound(cmd);
+    return syncFail(`/bin/sh: 1: ${binName}: not found\n`, 127);
   }
 
   // <binary> --version / -v
@@ -2451,7 +2678,7 @@ function handleSyncCommand(cmd: string, opts?: RunOptions): SyncCommandResult | 
       binName === "bun"
     )
       return null; // handled above
-    if (!isBinaryAvailable(binName)) throwCommandNotFound(cmd);
+    if (!isBinaryAvailable(binName)) return syncFail(`/bin/sh: 1: ${binName}: not found\n`, 127);
     // known binary but no version handler -- fall through to async
   }
 
@@ -2584,6 +2811,7 @@ export function spawn(
     spawnArgs = argsOrOpts;
     cfg = opts ?? {};
   } else if (argsOrOpts) cfg = argsOrOpts;
+  [command, spawnArgs] = applyShellOption(command, spawnArgs, cfg.shell);
 
   const child = new ShellProcess();
   const unsupportedNativeMessage = getUnsupportedNativeExecutableMessage(command);
@@ -2594,19 +2822,18 @@ export function spawn(
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = 127;
-      child.emit("close", 127, null);
       child.emit("exit", 127, null);
+      child.emit("close", 127, null);
     });
     return child;
   }
 
   // normalize stdio, node parity: 'pipe' default, 'inherit' to share parent
-  // streams, 'ignore' to drop. current spawn protocol only carries one
-  // top-level "pipe"|"inherit" so we pass "inherit" when stdin is inherit,
-  // else "pipe". stdout/stderr inherit works anyway because the streaming
-  // onStdout/onStderr callbacks route through getStdoutSink/getStderrSink.
+  // streams, 'ignore' to drop. The spawn request carries all three: the main
+  // thread forwards stdin and gives stdout a terminal only where inherited.
+  // stdout/stderr inherit also works through the streaming
+  // onStdout/onStderr callbacks, which route to getStdoutSink/getStderrSink.
   const stdioArr = normalizeStdio(cfg.stdio);
-  const stdinInherit = stdioArr[0] === "inherit";
   const stdoutInherit = stdioArr[1] === "inherit";
   const stderrInherit = stdioArr[2] === "inherit";
 
@@ -2632,7 +2859,8 @@ export function spawn(
     const operation = _spawnChildFn(command, spawnArgs, {
       cwd,
       env,
-      stdio: stdinInherit ? "inherit" : "pipe",
+      // per stream: the child gets a terminal only where it inherits one
+      stdio: stdioArr,
       onStdout: (data: string) => {
         stdoutStreamed = true;
         // pipe: buffer for parent to read via child.stdout.on('data')
@@ -2664,14 +2892,21 @@ export function spawn(
     operation.then(({ pid, exitCode, stdout, stderr }) => {
       childHandle.close();
       child.pid = pid;
-      // For commands that don't stream (builtins), push the buffered output
-      if (!stdoutStreamed && stdout) child.stdout?.push(Buffer.from(stdout));
-      if (!stderrStreamed && stderr) child.stderr?.push(Buffer.from(stderr));
+      // For commands that don't stream (builtins), push the buffered output,
+      // and show it where it is inherited (tsx --version runs node --version)
+      if (!stdoutStreamed && stdout) {
+        child.stdout?.push(Buffer.from(stdout));
+        if (stdoutInherit) getStdoutSink()?.(stdout);
+      }
+      if (!stderrStreamed && stderr) {
+        child.stderr?.push(Buffer.from(stderr));
+        if (stderrInherit) getStderrSink()?.(stderr);
+      }
       child.stdout?.push(null);
       child.stderr?.push(null);
       child.exitCode = exitCode;
-      child.emit("close", exitCode, null);
       child.emit("exit", exitCode, null);
+      child.emit("close", exitCode, null);
     }).catch((e) => {
       childHandle.close();
       child.emit("error", e instanceof Error ? e : new Error(String(e)));
@@ -2693,8 +2928,8 @@ export function spawn(
         child.stdout?.push(null);
         child.stderr?.push(null);
         child.exitCode = exitCode;
-        child.emit("close", exitCode, null);
         child.emit("exit", exitCode, null);
+        child.emit("close", exitCode, null);
       },
       (e) => {
         child.emit("error", e instanceof Error ? e : new Error(String(e)));
@@ -2735,8 +2970,11 @@ export function spawnSync(
   }
 
   // Keep argv intact for sync builtins and the Atomics path — never join/split
-  // on whitespace (that destroys args that contain spaces).
-  const shellCommand = shellCommandFromArgv(cmd, spawnArgs);
+  // on whitespace (that destroys args that contain spaces). With `shell` the
+  // joined line is what the shell parses (node), so it goes as is.
+  const shellCommand = cfg.shell
+    ? [cmd, ...spawnArgs].join(" ")
+    : shellCommandFromArgv(cmd, spawnArgs);
   const syncResult = handleSyncCommand(shellCommand, {
     cwd: cfg.cwd,
     env: cfg.env,
@@ -2745,6 +2983,11 @@ export function spawnSync(
   if (syncResult !== null) {
     const stdout = Buffer.from(syncResult.stdout);
     const stderr = Buffer.from(syncResult.stderr ?? "");
+    // inherited streams are the parent's, as on the Atomics path: without
+    // this, e.g. the TypeScript 7 native-compiler notice never shows
+    const stdio = normalizeStdio(cfg.stdio);
+    if (stdio[1] === "inherit" && syncResult.stdout) getStdoutSink()?.(syncResult.stdout);
+    if (stdio[2] === "inherit" && syncResult.stderr) getStderrSink()?.(syncResult.stderr);
     return {
       stdout,
       stderr,
@@ -2788,9 +3031,13 @@ export function spawnSync(
 
   // blocks until main thread spawns child and child completes
   try {
-    const { exitCode, stdout: stdoutStr } = _syncChannel.waitForResult(slot, 120_000);
+    const { exitCode, stdout: stdoutStr, stderr: stderrStr } = _syncChannel.waitForResult(
+      slot,
+      120_000,
+      () => requestMoreSyncOutput(slot),
+    );
     const stdout = Buffer.from(stdoutStr);
-    const stderr = Buffer.from("");
+    const stderr = Buffer.from(stderrStr);
     return {
       stdout,
       stderr,
@@ -2801,7 +3048,7 @@ export function spawnSync(
     };
   } catch (e: any) {
     const stdout = Buffer.from(e?.stdout ?? "");
-    const stderr = Buffer.from(e?.message ?? "");
+    const stderr = Buffer.from(e?.stderr || e?.message || "");
     return {
       stdout,
       stderr,
@@ -2824,6 +3071,7 @@ export function execFileSync(
   const result = spawnSync(file, fileArgs, {
     cwd: opts?.cwd,
     env: opts?.env as Record<string, string> | undefined,
+    stdio: execSyncStdio(opts?.stdio) as SpawnConfig["stdio"],
   });
   if (result.status !== 0 || result.error) {
     throwExecSyncFailed(
@@ -2984,7 +3232,14 @@ export function fork(
     cfg = opts ?? {};
   } else if (argsOrOpts) cfg = argsOrOpts;
 
+  const serialization = (cfg.serialization ?? "json") as IpcSerialization;
+  if (serialization !== "json" && serialization !== "advanced") {
+    throw new TypeError("serialization must be 'json' or 'advanced'");
+  }
+
   const cwd = (cfg.cwd as string) || getShellCwd();
+  const execArgv = (cfg.execArgv as string[] | undefined) ??
+    (globalThis as any).process?.execArgv ?? [];
   const env = (cfg.env as Record<string, string>) ||
     (_shell?.getEnv() ?? {});
 
@@ -2995,6 +3250,7 @@ export function fork(
   const child = new ShellProcess();
   child.connected = true;
   child.spawnargs = ["node", resolved, ...args];
+  child.spawnargs.splice(1, 0, ...execArgv);
   child.spawnfile = "node";
 
   if (!_forkChildFn) {
@@ -3011,6 +3267,8 @@ export function fork(
   const handle = _forkChildFn(resolved, args, {
     cwd,
     env,
+    serialization,
+    execArgv: execArgv.slice(),
     onStdout: (data: string) => {
       child.stdout?.emit("data", data);
       // also route through parent's stdout sink (fork inherits stdio by default)
@@ -3025,6 +3283,11 @@ export function fork(
     onIPC: (data: unknown) => {
       child.emit("message", data);
     },
+    onDisconnect: () => {
+      if (!child.connected) return;
+      child.connected = false;
+      child.emit("disconnect");
+    },
     onExit: (exitCode: number) => {
       childHandle.close();
       child.exitCode = exitCode;
@@ -3035,9 +3298,10 @@ export function fork(
   });
 
   // parent→child IPC
-  child.send = (msg: unknown, _cb?: (e: Error | null) => void): boolean => {
+  child.send = (msg: unknown, cb?: (e: Error | null) => void): boolean => {
     if (!child.connected) return false;
-    handle.sendIPC(msg);
+    handle.sendIPC(serializeIpcMessage(msg, serialization));
+    if (typeof cb === "function") queueMicrotask(() => cb(null));
     return true;
   };
 

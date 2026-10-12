@@ -29,35 +29,45 @@ const allExternal = [
 ];
 
 /**
- * Vite plugin that pre-bundles process-worker-entry.ts into a self-contained
- * JS string. This is necessary because consumers of nodepod (Next.js, Webpack,
- * etc.) can't resolve Vite-specific worker chunk URLs. Instead, we embed the
- * entire worker bundle as a string and create Blob URL workers at runtime.
- * The same bundle is also emitted as dist/__worker__.js so runtimes that can
- * reach it as a same-origin asset skip parsing the embedded copy entirely.
+ * Vite plugin that emits same-origin process and engine Worker entrypoints.
  */
 function inlineProcessWorkerPlugin() {
   const VIRTUAL_ID = "virtual:process-worker-bundle";
   const RESOLVED_ID = "\0" + VIRTUAL_ID;
   let workerBundle = "";
+  let engineWorkerBundle = "";
 
   return {
     name: "inline-process-worker",
     async buildStart() {
-      const result = await esbuild({
-        entryPoints: [resolve(__dirname, "src/threading/process-worker-entry.ts")],
-        bundle: true,
-        format: "iife",
-        platform: "browser",
-        target: "esnext",
-        write: false,
-        minify: process.env.NODEPOD_UNMINIFIED !== "1",
-        define: buildDefines,
-        legalComments: "none",
-        sourcemap: false,
-        // Don't externalize anything — the worker must be fully self-contained
-      });
-      workerBundle = result.outputFiles[0].text;
+      const [processResult, engineResult] = await Promise.all([
+        esbuild({
+          entryPoints: [resolve(__dirname, "src/threading/process-worker-entry.ts")],
+          bundle: true,
+          format: "iife",
+          platform: "browser",
+          target: "esnext",
+          write: false,
+          minify: process.env.NODEPOD_UNMINIFIED !== "1",
+          define: buildDefines,
+          legalComments: "none",
+          sourcemap: false,
+        }),
+        esbuild({
+          entryPoints: [resolve(__dirname, "src/threading/engine-worker.ts")],
+          bundle: true,
+          format: "iife",
+          platform: "browser",
+          target: "esnext",
+          write: false,
+          minify: process.env.NODEPOD_UNMINIFIED !== "1",
+          define: buildDefines,
+          legalComments: "none",
+          sourcemap: false,
+        }),
+      ]);
+      workerBundle = processResult.outputFiles[0].text;
+      engineWorkerBundle = engineResult.outputFiles[0].text;
     },
     resolveId(id) {
       if (id === VIRTUAL_ID) return RESOLVED_ID;
@@ -73,6 +83,11 @@ function inlineProcessWorkerPlugin() {
         type: "asset",
         fileName: "__worker__.js",
         source: workerBundle,
+      });
+      this.emitFile({
+        type: "asset",
+        fileName: "__nodepod/engine-worker.js",
+        source: engineWorkerBundle,
       });
     },
   };

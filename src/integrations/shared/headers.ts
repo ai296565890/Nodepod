@@ -5,6 +5,46 @@ export const DEFAULT_SW_PATH = "/__sw__.js";
 export const DEFAULT_BRIDGE_HTML_PATH = "/__nodepod_bridge__.html";
 export const DEFAULT_BRIDGE_SCRIPT_PATH = "/__nodepod_bridge__.js";
 
+export const NODEPOD_WORKER_PATHS = [
+  "/__worker__.js",
+  "/__nodepod/source-worker.js",
+  "/__nodepod/engine-worker.js",
+  "/__nodepod/wasm-compile-worker.js",
+  "/__nodepod/deflate-worker.js",
+] as const;
+
+export function workerResponseHeaders(origin: string): Record<string, string> {
+  const parsedOrigin = new URL(origin);
+  if (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") {
+    throw new Error(`Unsupported Worker asset origin: ${parsedOrigin.protocol}`);
+  }
+  const normalizedOrigin = parsedOrigin.origin;
+  return {
+    "Content-Type": "application/javascript; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": [
+      "default-src 'none'",
+      "script-src 'self' 'unsafe-eval'",
+      `worker-src ${workerSrcDirective(normalizedOrigin)}`,
+      `connect-src ${normalizedOrigin}/__nodepod/assets/ ${normalizedOrigin}/__nodepod/egress/`,
+      "object-src 'none'",
+      "base-uri 'none'",
+    ].join("; "),
+  };
+}
+
+export function workerSrcDirective(origin: string): string {
+  const parsedOrigin = new URL(origin);
+  if (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") {
+    throw new Error(`Unsupported Worker source origin: ${parsedOrigin.protocol}`);
+  }
+  return NODEPOD_WORKER_PATHS
+    .map((path) => `${parsedOrigin.origin}${path}`)
+    .join(" ");
+}
+
 /**
  * Headers for the nodepod service worker response.
  *

@@ -5,6 +5,7 @@
 
 import type { MemoryVolume } from "../memory-volume";
 import { precompileWasm, registerCompiledModule, PRECOMPILE_THRESHOLD } from "./wasm-cache";
+import { proxyUrlForFetch } from "../cross-origin";
 
 const WASM_DEBUG_SUFFIX = ".debug.wasm";
 
@@ -121,7 +122,7 @@ export function prefetchWasmFromCdn(volume: MemoryVolume, vfsPath: string): Prom
     if (_refusedPackages.has(packageKey)) return false;
 
     try {
-      const resp = await fetch(cdnUrl);
+      const resp = await fetch(proxyUrlForFetch(cdnUrl) ?? cdnUrl);
       if (!resp.ok) {
         if (resp.status === 403) _refusedPackages.add(packageKey);
         return false;

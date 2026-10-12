@@ -143,6 +143,7 @@ describe("WASM resources", () => {
 
   it("releases failed worker-post callbacks before falling back", async () => {
     const terminate = vi.fn();
+    vi.stubGlobal("location", { origin: "https://nodepod.test", protocol: "https:" });
     class BrokenWorker {
       onmessage: unknown;
       onerror: unknown;
@@ -169,6 +170,7 @@ describe("WASM resources", () => {
 
   it("transfers one owned binary and preserves sizing after the transfer", async () => {
     const payloads: ArrayBuffer[] = [];
+    vi.stubGlobal("location", { origin: "https://nodepod.test", protocol: "https:" });
     class CompileWorker {
       onmessage: ((event: { data: unknown }) => void) | null = null;
       onerror: unknown;

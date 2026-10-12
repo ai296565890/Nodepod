@@ -15,6 +15,7 @@ Nodepod is **not a hardened security sandbox**. It is a runtime built on browser
 - `allowedFetchDomains` controls the destinations checked by Nodepod's optional CORS proxy. Passing `null` disables that allowlist. Without a configured CORS proxy, browser fetches still follow normal browser CORS and host policies.
 - Files and snapshots are client-side data. Do not seed credentials, signing keys, backend tokens, or private source that a visitor should not read.
 - User-provided code can consume CPU, memory, storage, and network capacity. Apply product-level limits and provide a termination path.
+- A same-origin Worker CSP can keep `unsafe-eval` out of the page policy, but it does not separate IndexedDB or other origin-scoped storage. For untrusted code, keep a dedicated preview origin or obtain a security review of the storage and network boundaries before running it on an application origin.
 
 ## Recommended posture
 

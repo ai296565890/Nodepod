@@ -4,7 +4,7 @@
 
 import { wrap, type Remote } from "comlink";
 import type { OffloadWorkerEndpoint, PoolConfig } from "./offload-types";
-import { createInlineWorker, revokeInlineWorkerUrl } from "./inline-worker";
+import { createInlineWorker, disposeInlineWorkerHost } from "./inline-worker";
 import { TIMEOUTS, LIMITS } from "../constants/config";
 import type { HostWorker } from "../host/types";
 
@@ -117,7 +117,7 @@ export class WorkerPool {
       this.terminateWorker(w);
     }
     this.rejectAllWaiters();
-    revokeInlineWorkerUrl();
+    disposeInlineWorkerHost();
   }
 
   stats(): {

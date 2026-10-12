@@ -3,6 +3,7 @@
 import { wrap, proxy, Remote } from 'comlink';
 import type { MemoryVolume } from './memory-volume';
 import type { IScriptEngine, ExecutionOutcome, EngineConfig, VolumeSnapshot } from './engine-types';
+import { nodepodAssetUrl } from './helpers/nodepod-assets';
 
 interface WorkerEndpoint {
   init(snapshot: VolumeSnapshot, config: EngineConfig): void;
@@ -16,10 +17,7 @@ interface WorkerEndpoint {
 
 // URL is built at runtime so bundlers can't statically resolve it
 function createWorker(): Worker {
-  const base = import.meta.url;
-  const path = './threading/engine-worker' + '.ts';
-  const url = new (globalThis.URL)(path, base);
-  return new (globalThis.Worker)(url, { type: 'module' });
+  return new (globalThis.Worker)(nodepodAssetUrl('engine-worker.js'), { type: 'module' });
 }
 
 export class WorkerSandbox implements IScriptEngine {

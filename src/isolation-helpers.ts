@@ -26,7 +26,7 @@ function readServiceWorkerSource(): string | null {
   }
 }
 
-import { DEFAULT_NODEPOD_CDN } from "./constants/config";
+import { DEFAULT_NODEPOD_URL } from "./constants/config";
 
 export interface SandboxPageConfig {
   nodepodUrl?: string;
@@ -38,7 +38,7 @@ export interface SandboxPageConfig {
 
 export function getSandboxPageHtml(config: SandboxPageConfig | string = {}): string {
   const opts: SandboxPageConfig = typeof config === 'string' ? { nodepodUrl: config } : config;
-  const nodepodUrl = opts.nodepodUrl ?? DEFAULT_NODEPOD_CDN;
+  const nodepodUrl = opts.nodepodUrl ?? DEFAULT_NODEPOD_URL;
   const withSW = opts.enableServiceWorker ?? true;
   const parentOriginJs = opts.parentOrigin ? JSON.stringify(opts.parentOrigin) : "'*'";
 
@@ -126,6 +126,11 @@ export interface GeneratedSandboxFiles {
 
 export function generateSandboxDeployment(config: SandboxPageConfig | string = {}): GeneratedSandboxFiles {
   const opts: SandboxPageConfig = typeof config === 'string' ? { nodepodUrl: config } : config;
+  if (!opts.nodepodUrl) {
+    throw new Error(
+      "generateSandboxDeployment requires nodepodUrl: standalone deployments must explicitly configure where the Nodepod runtime and its same-origin assets are hosted",
+    );
+  }
   const withSW = opts.enableServiceWorker ?? true;
   const swSource = withSW ? readServiceWorkerSource() : null;
 
@@ -142,7 +147,9 @@ export const SANDBOX_DEPLOYMENT_GUIDE = `
 # Deploying a Nodepod Sandbox
 
 ## 1. Generate sandbox files
-   Use generateSandboxDeployment() to create the required files.
+   Use generateSandboxDeployment({ nodepodUrl: 'https://sandbox.example.com/__nodepod/legacy-runtime/index.mjs' }).
+   The runtime URL must be on the generated page's origin, with Nodepod assets and the egress route hosted there.
+   The generated files do not bundle those assets or the egress handler.
 
 ## 2. Deploy to a hosting provider
    cd sandbox && vercel --prod

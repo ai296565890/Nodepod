@@ -13,8 +13,6 @@ const DEFAULT_ALLOWED_DOMAINS = [
   'esm.sh',
   'unpkg.com',
   'cdn.jsdelivr.net',
-  'localhost',
-  '127.0.0.1',
 ];
 
 function getActiveProxy(): string | null {

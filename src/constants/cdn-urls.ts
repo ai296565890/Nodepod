@@ -1,18 +1,16 @@
-// Pinned CDN versions and URLs
+// Pinned runtime dependency versions and same-origin asset URLs
 
 export const PINNED_ESBUILD_WASM = '0.28.2';
 export const PINNED_ROLLUP_BROWSER = '4.44.0';
-export const PINNED_BROTLI_WASM = '3.0.1';
+export const PINNED_BROTLI_WASM = '3.0.3';
 export const PINNED_LIGHTNINGCSS_WASM = '1.31.1';
 export const PINNED_WA_SQLITE = '1.0.0';
 
-// Faster drop-ins with identical output (github.com/R1ck404/fast-packages).
-// fast-esbuild-wasm is all JavaScript: it ships no esbuild.wasm. jsdelivr
-// serves the package's files as published (esm.sh rebundles them, and answers
-// 404 for a few minutes after a release).
+// fast-esbuild-wasm is all JavaScript: it ships no esbuild.wasm.
 const PINNED_FAST_ESBUILD = '0.28.5'; // (initialize({ serviceInWorker, smallInput }) since 0.28.4)
 const PINNED_FAST_BROTLI = '3.0.3';
-const FAST_ESBUILD_BASE = `https://cdn.jsdelivr.net/npm/@r1ck404/fast-esbuild-wasm@${PINNED_FAST_ESBUILD}`;
+const NODEPOD_ASSET_BASE = "/__nodepod/assets";
+const FAST_ESBUILD_BASE = `${NODEPOD_ASSET_BASE}/fast-esbuild-wasm`;
 export const ESBUILD_HAS_BINARY = false;
 
 export const CDN_ESBUILD_ESM = `${FAST_ESBUILD_BASE}/esm/browser.min.js`;
@@ -25,17 +23,28 @@ export const CDN_ESBUILD_BUNDLE = `${FAST_ESBUILD_BASE}/esm/browser.min.js`;
 // esbuild's browser build as a classic script, evaluated once per instance
 // (see esbuild-engine.ts)
 export const CDN_ESBUILD_BROWSER_SCRIPT = `${FAST_ESBUILD_BASE}/lib/browser.min.js`;
-export const CDN_ROLLUP_BROWSER = `https://esm.sh/@rollup/browser@${PINNED_ROLLUP_BROWSER}`;
-// jsdelivr serves raw files without rebundling. esm.sh rebundles everything
-// which breaks brotli-wasm's circular WASM/JS-glue dependencies, causing
-// `(void 0) is not a function` at runtime. The pkg.web variant has a proper
-// init() that fetches the co-located .wasm binary via import.meta.url.
-export const CDN_BROTLI_WASM = `https://cdn.jsdelivr.net/npm/@r1ck404/fast-brotli-wasm@${PINNED_FAST_BROTLI}/pkg.web.mjs`;
-export const CDN_LIGHTNINGCSS_WASM = `https://esm.sh/lightningcss-wasm@${PINNED_LIGHTNINGCSS_WASM}`;
-export const CDN_WA_SQLITE = `https://cdn.jsdelivr.net/npm/wa-sqlite@${PINNED_WA_SQLITE}/dist/wa-sqlite.mjs`;
-export const CDN_WA_SQLITE_WASM = `https://cdn.jsdelivr.net/npm/wa-sqlite@${PINNED_WA_SQLITE}/dist/wa-sqlite.wasm`;
+export const CDN_ROLLUP_BROWSER = `${NODEPOD_ASSET_BASE}/rollup-browser/dist/es/rollup.browser.js`;
+// The browser build keeps its WASM glue next to the copied binary asset.
+export const CDN_BROTLI_WASM = `${NODEPOD_ASSET_BASE}/fast-brotli-wasm/pkg.web.mjs`;
+export const CDN_LIGHTNINGCSS_WASM = `${NODEPOD_ASSET_BASE}/lightningcss-wasm/index.mjs`;
+export const CDN_WA_SQLITE = `${NODEPOD_ASSET_BASE}/wa-sqlite/dist/wa-sqlite.mjs`;
+export const CDN_WA_SQLITE_WASM = `${NODEPOD_ASSET_BASE}/wa-sqlite/dist/wa-sqlite.wasm`;
 
-// new Function hides import() from bundler static analysis so CDN URLs work at runtime
-// eslint-disable-next-line @typescript-eslint/no-implied-eval
-const _dynamicImport = new Function("url", "return import(url)") as (url: string) => Promise<any>;
-export { _dynamicImport as cdnImport };
+export function cdnImport(url: string): Promise<any> {
+  const isBrowserRealm =
+    typeof location !== "undefined" &&
+    (location.protocol === "https:" || location.protocol === "http:");
+  if (!isBrowserRealm && url.startsWith(`${NODEPOD_ASSET_BASE}/`)) {
+    const serverPackages: Record<string, string> = {
+      [`${FAST_ESBUILD_BASE}/esm/browser.min.js`]: "@r1ck404/fast-esbuild-wasm/esm/browser.min.js",
+      [`${FAST_ESBUILD_BASE}/lib/browser.min.js`]: "@r1ck404/fast-esbuild-wasm/lib/browser.min.js",
+      [`${NODEPOD_ASSET_BASE}/rollup-browser/dist/es/rollup.browser.js`]: "@rollup/browser",
+      [`${NODEPOD_ASSET_BASE}/fast-brotli-wasm/pkg.web.mjs`]: "brotli-wasm",
+      [`${NODEPOD_ASSET_BASE}/lightningcss-wasm/index.mjs`]: "lightningcss-wasm",
+      [`${NODEPOD_ASSET_BASE}/wa-sqlite/dist/wa-sqlite.mjs`]: "wa-sqlite/dist/wa-sqlite.mjs",
+    };
+    const packageUrl = serverPackages[url];
+    if (packageUrl) return import(packageUrl);
+  }
+  return import(/* @vite-ignore */ url);
+}

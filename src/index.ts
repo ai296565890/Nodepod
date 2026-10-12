@@ -72,6 +72,7 @@ export {
   setProxy as setCorsProxy,
   getProxy as getCorsProxy,
   setAllowedDomains,
+  setProxy,
 } from "./cross-origin";
 export * as chokidar from "./polyfills/chokidar";
 export * as ws from "./polyfills/ws";

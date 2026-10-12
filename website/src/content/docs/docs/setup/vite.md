@@ -18,6 +18,8 @@ export default defineConfig({
 
 The plugin serves the service worker, process worker, and preview bridge during development and emits the required assets during production builds. It must run on the origin where the Nodepod host page loads.
 
+For the Worker-only CSP, same-origin dependency assets, and the Vite development/preview headers, see [Same-origin Worker CSP](/Nodepod/docs/setup/same-origin-worker-csp/).
+
 Then boot the runtime from application code:
 
 ```ts

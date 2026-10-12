@@ -11,6 +11,12 @@ importers:
       '@noble/hashes':
         specifier: npm:@r1ck404/fast-noble-hashes@1.8.2
         version: '@r1ck404/fast-noble-hashes@1.8.2'
+      '@r1ck404/fast-esbuild-wasm':
+        specifier: 0.28.5
+        version: 0.28.5
+      '@rollup/browser':
+        specifier: 4.44.0
+        version: 4.44.0
       '@xterm/addon-fit':
         specifier: ^0.11.0
         version: 0.11.0
@@ -41,6 +47,9 @@ importers:
       es-module-lexer:
         specifier: npm:@r1ck404/fast-es-module-lexer@1.7.2
         version: '@r1ck404/fast-es-module-lexer@1.7.2'
+      lightningcss-wasm:
+        specifier: 1.31.1
+        version: 1.31.1
       pako:
         specifier: npm:@r1ck404/fast-pako@2.1.2
         version: '@r1ck404/fast-pako@2.1.2'
@@ -50,6 +59,9 @@ importers:
       set-cookie-parser:
         specifier: ^3.1.1
         version: 3.1.1
+      wa-sqlite:
+        specifier: 1.0.0
+        version: 1.0.0
     devDependencies:
       '@playwright/test':
         specifier: ^1.61.1
@@ -93,9 +105,6 @@ importers:
       vitest:
         specifier: 4.0.18
         version: 4.0.18(@types/node@25.9.4)(lightningcss@1.33.0)(yaml@2.9.0)
-      wa-sqlite:
-        specifier: ^1.0.0
-        version: 1.0.0
 
   website:
     dependencies:
@@ -1234,6 +1243,11 @@ packages:
     resolution: {integrity: sha512-wQU8E5Rbc9ZizYWiYfNSMrANscBQzDjrSq4NdynqdtA32oiByJnEU4ANJZTL+X97srMpF1LTqSdvqcwIws6ZYw==}
     engines: {node: '>=18'}
 
+  '@r1ck404/fast-esbuild-wasm@0.28.5':
+    resolution: {integrity: sha512-WB47b6l9ZmzLqqeq7lhcwBJBP6KH8eCG5UfenssUUwdtQCutl4QSwZZAFUtDohGf/veOJ8ifCp4UORD7kyY5lg==}
+    engines: {node: '>=18'}
+    hasBin: true
+
   '@r1ck404/fast-noble-hashes@1.8.2':
     resolution: {integrity: sha512-vSEY0/fQK3UrYHAhL/pWFKO8UBHCO0fXde0pZsh1TDpt53Lw2X/BLV64BEGIvI9dsXHymR7UK7NmzAHVAzmS/A==}
     engines: {node: ^14.21.3 || >=16}
@@ -1334,6 +1348,9 @@ packages:
 
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+
+  '@rollup/browser@4.44.0':
+    resolution: {integrity: sha512-Ae4Ye3niSfr/2MQEqlhDHCQxv/qsvdIz3+quLgbPn7mP+hTYH7JpBF/kfKkPDCi6Le3zyz/ewk46xgnPLQderw==}
 
   '@rollup/plugin-virtual@3.0.2':
     resolution: {integrity: sha512-10monEYsBp3scM4/ND4LNH5Rxvh3e/cVeL3jWTgZ2SrQ+BmUoQcopVQvnaMcOnykb1VkxUFuDAN+0FnpTFRy2A==}
@@ -1641,6 +1658,9 @@ packages:
 
   '@types/estree-jsx@1.0.5':
     resolution: {integrity: sha512-52CcUVNFyfb1A2ALocQw/Dd1BQFNmSdkuC3BkZ6iqhdMfQz7JWOFRuJFloOzjk+6WijU56m9oKXFAXc7o3Towg==}
+
+  '@types/estree@1.0.8':
+    resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
 
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
@@ -2455,6 +2475,12 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [musl]
+
+  lightningcss-wasm@1.31.1:
+    resolution: {integrity: sha512-JYnA3ZpKhF/X+pkLBPMsqDAXZmxd2mQ4nauKd78IfMnioook736ksaCJu6d70Wkq6soD74V+G4fhaOWmWzW5dg==}
+    engines: {node: '>= 12.0.0'}
+    bundledDependencies:
+      - napi-wasm
 
   lightningcss-win32-arm64-msvc@1.33.0:
     resolution: {integrity: sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA==}
@@ -4462,6 +4488,8 @@ snapshots:
 
   '@r1ck404/fast-es-module-lexer@1.7.2': {}
 
+  '@r1ck404/fast-esbuild-wasm@0.28.5': {}
+
   '@r1ck404/fast-noble-hashes@1.8.2': {}
 
   '@r1ck404/fast-pako@2.1.2': {}
@@ -4509,6 +4537,10 @@ snapshots:
     optional: true
 
   '@rolldown/pluginutils@1.0.1': {}
+
+  '@rollup/browser@4.44.0':
+    dependencies:
+      '@types/estree': 1.0.8
 
   '@rollup/plugin-virtual@3.0.2(rollup@4.62.2)':
     optionalDependencies:
@@ -4734,6 +4766,8 @@ snapshots:
   '@types/estree-jsx@1.0.5':
     dependencies:
       '@types/estree': 1.0.9
+
+  '@types/estree@1.0.8': {}
 
   '@types/estree@1.0.9': {}
 
@@ -5711,6 +5745,8 @@ snapshots:
 
   lightningcss-linux-x64-musl@1.33.0:
     optional: true
+
+  lightningcss-wasm@1.31.1: {}
 
   lightningcss-win32-arm64-msvc@1.33.0:
     optional: true

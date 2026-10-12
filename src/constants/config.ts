@@ -33,11 +33,11 @@ export const NPM_REGISTRY_URL = "https://registry.npmjs.org";
 export const NPM_REGISTRY_URL_SLASH = "https://registry.npmjs.org/";
 
 // ---------------------------------------------------------------------------
-// CDN (pako only -- the rest are in cdn-urls.ts)
+// Pinned package versions
 // ---------------------------------------------------------------------------
 
 export const PINNED_PAKO = "2.1.2";
-export const CDN_PAKO = `https://cdn.jsdelivr.net/npm/@r1ck404/fast-pako@${PINNED_PAKO}/index.mjs`;
+export const CDN_PAKO = `/__nodepod/assets/fast-pako/index.mjs`;
 
 // ---------------------------------------------------------------------------
 // Module resolution file extensions
@@ -217,7 +217,7 @@ export const PORT_RANGE = {
 // CDN
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_NODEPOD_CDN = "https://unpkg.com/@r1ck404/nodepod/dist/index.js";
+export const DEFAULT_NODEPOD_URL = "/__nodepod/legacy-runtime/index.mjs";
 
 // ---------------------------------------------------------------------------
 // PIDs

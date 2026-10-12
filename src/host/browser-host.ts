@@ -1,9 +1,8 @@
-import { ungzip } from "pako";
-import { PROCESS_WORKER_BUNDLE_GZIP_BASE64 } from "virtual:process-worker-bundle";
 import { openSnapshotCache } from "../persistence/idb-cache";
 import { openOPFSSnapshotCache } from "../persistence/opfs-snapshot-cache";
 import { createIndexedDBWorkspaceStore } from "../persistence/workspace/idb-store";
 import { registerDefaultHostFactory } from "./runtime-host";
+import { nodepodAssetUrl } from "../helpers/nodepod-assets";
 import type {
   HostWorker,
   HttpIngress,
@@ -12,43 +11,19 @@ import type {
   WorkerSpec,
 } from "./types";
 
-function wrapBrowserWorker(worker: Worker, revokeUrl?: string | null): HostWorker {
-  const host = worker as unknown as HostWorker;
-  if (revokeUrl) host.__nodepodRevokeUrl = revokeUrl;
-  return host;
+function wrapBrowserWorker(worker: Worker): HostWorker {
+  return worker as unknown as HostWorker;
 }
 
 export function createBrowserHost(): RuntimeHost {
   let externalWorkerUrl: string | null = null;
   let workerProbePromise: Promise<string | null> | null = null;
-  let embeddedBlobUrl: string | null = null;
-
-  function ensureEmbeddedProcessUrl(): string {
-    if (embeddedBlobUrl) return embeddedBlobUrl;
-    if (!PROCESS_WORKER_BUNDLE_GZIP_BASE64) {
-      throw new Error(
-        "[Nodepod] Process worker bundle is empty. Build the library or provide workerUrl.",
-      );
-    }
-    const binary = atob(PROCESS_WORKER_BUNDLE_GZIP_BASE64);
-    const compressed = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
-    const source = ungzip(compressed, { to: "string" }) as string;
-    const blob = new Blob([source], { type: "application/javascript" });
-    embeddedBlobUrl = URL.createObjectURL(blob);
-    return embeddedBlobUrl;
-  }
 
   return {
     kind: "browser",
 
     canCreateWorkers(): boolean {
-      return (
-        typeof Worker !== "undefined" &&
-        typeof Blob !== "undefined" &&
-        typeof URL !== "undefined" &&
-        typeof URL.createObjectURL === "function"
-      );
+      return typeof Worker !== "undefined";
     },
 
     createWorker(spec: WorkerSpec): HostWorker {
@@ -63,25 +38,19 @@ export function createBrowserHost(): RuntimeHost {
       }
 
       if (spec.type === "source") {
-        const url = URL.createObjectURL(
-          new Blob([spec.source], { type: "application/javascript" }),
+        const worker = wrapBrowserWorker(
+          new Worker(nodepodAssetUrl("source-worker.js"), { name: spec.name }),
         );
-        return wrapBrowserWorker(new Worker(url, { name: spec.name }), url);
+        worker.postMessage({ __nodepod_source__: spec.source });
+        return worker;
       }
 
-      if (!spec.embedded && externalWorkerUrl) {
-        try {
-          const w = wrapBrowserWorker(
-            new Worker(externalWorkerUrl, { name: spec.name }),
-          );
-          w.__nodepodDirect = true;
-          return w;
-        } catch {
-          externalWorkerUrl = null;
-        }
-      }
-      const url = ensureEmbeddedProcessUrl();
-      return wrapBrowserWorker(new Worker(url, { name: spec.name }));
+      const url = spec.embedded
+        ? new URL("/__worker__.js", location.origin).href
+        : externalWorkerUrl ?? new URL("/__worker__.js", location.origin).href;
+      const worker = wrapBrowserWorker(new Worker(url, { name: spec.name }));
+      worker.__nodepodDirect = true;
+      return worker;
     },
 
     async probeProcessWorkerUrl(workerUrl?: string): Promise<string | null> {
@@ -91,7 +60,7 @@ export function createBrowserHost(): RuntimeHost {
         let url: string | null = workerUrl ?? null;
         if (!url) {
           try {
-            url = new URL("./__worker__.js", import.meta.url).href;
+            url = new URL("/__worker__.js", location.origin).href;
           } catch {
             return null;
           }
@@ -113,24 +82,7 @@ export function createBrowserHost(): RuntimeHost {
       return workerProbePromise;
     },
 
-    revokeObjectUrl(url: string): void {
-      try {
-        URL.revokeObjectURL(url);
-      } catch {
-        /* ignore */
-      }
-      if (url === embeddedBlobUrl) embeddedBlobUrl = null;
-    },
-
     disposeGlobalResources(): void {
-      if (embeddedBlobUrl) {
-        try {
-          URL.revokeObjectURL(embeddedBlobUrl);
-        } catch {
-          /* ignore */
-        }
-        embeddedBlobUrl = null;
-      }
       externalWorkerUrl = null;
       workerProbePromise = null;
     },

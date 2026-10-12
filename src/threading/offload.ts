@@ -48,9 +48,7 @@ function canUseWorkers(): boolean {
   // Do not import RuntimeHost here — process-worker bundles archive-extractor → offload.
   return (
     typeof Worker !== "undefined" &&
-    typeof Blob !== "undefined" &&
-    typeof URL !== "undefined" &&
-    typeof URL.createObjectURL === "function"
+    typeof location !== "undefined"
   );
 }
 

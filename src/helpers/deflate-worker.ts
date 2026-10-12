@@ -3,21 +3,13 @@
 // package content without spending main-thread time on it; inflating the
 // result synchronously (pako.inflateRaw) stays on the reader's side.
 
+import { nodepodAssetUrl } from "./nodepod-assets";
+
 export interface OffThreadDeflater {
   /** deflate-raw of `bytes`. The buffer is transferred: don't use it afterwards. */
   deflate(bytes: Uint8Array): Promise<Uint8Array>;
   dispose(): void;
 }
-
-const WORKER_SOURCE = `onmessage = async (e) => {
-  const { id, buf } = e.data;
-  try {
-    const out = await new Response(new Blob([buf]).stream().pipeThrough(new CompressionStream("deflate-raw"))).arrayBuffer();
-    postMessage({ id, buf: out }, [out]);
-  } catch (err) {
-    postMessage({ id, error: String(err) });
-  }
-};`;
 
 // the worker holds a thread and a heap: drop it between packing rounds
 const IDLE_MS = 5000;
@@ -27,13 +19,10 @@ export function createOffThreadDeflater(): OffThreadDeflater | null {
   if (
     typeof Worker === "undefined" ||
     typeof CompressionStream === "undefined" ||
-    typeof Blob === "undefined" ||
-    typeof URL === "undefined" ||
-    typeof URL.createObjectURL !== "function"
+    typeof location === "undefined"
   ) {
     return null;
   }
-  let url: string | null = null;
   let worker: Worker | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let nextId = 1;
@@ -52,8 +41,7 @@ export function createOffThreadDeflater(): OffThreadDeflater | null {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = null;
     if (worker) return worker;
-    url ??= URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
-    const w = new Worker(url);
+    const w = new Worker(nodepodAssetUrl("deflate-worker.js"));
     w.onmessage = (e: MessageEvent) => {
       const { id, buf, error } = e.data as { id: number; buf?: ArrayBuffer; error?: string };
       const p = pending.get(id);
@@ -93,8 +81,6 @@ export function createOffThreadDeflater(): OffThreadDeflater | null {
     },
     dispose(): void {
       stop();
-      if (url) URL.revokeObjectURL(url);
-      url = null;
     },
   };
 }

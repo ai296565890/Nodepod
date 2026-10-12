@@ -48,9 +48,9 @@ describe("cross-origin allowlist", () => {
     expect(() => resolveProxyUrl("https://evil.localhost/x")).toThrow(/Fetch blocked/);
   });
 
-  it("allows exact localhost match", () => {
+  it("blocks loopback by default", () => {
     setProxy("https://proxy.test/?url=");
-    expect(resolveProxyUrl("http://localhost/x")).toContain("proxy.test");
+    expect(() => resolveProxyUrl("http://localhost/x")).toThrow(/Fetch blocked/);
   });
 
   it("allows all when allowlist is null", () => {

@@ -1,6 +1,6 @@
-// creates offload workers from an embedded source string via Blob URL so no separate file needs serving
+// Creates offload workers from a source string through the same-origin Worker endpoint.
 // speaks Comlink's wire protocol directly so the message listener is synchronous on boot — avoids races with the first init() call
-// heavy deps (esbuild, pako) load from CDN lazily
+// Heavy dependencies (esbuild, pako) load from same-origin assets lazily.
 
 import { CDN_ESBUILD_ESM, CDN_ESBUILD_BINARY } from "../constants/cdn-urls";
 import { CDN_PAKO } from "../constants/config";
@@ -10,12 +10,12 @@ import type { HostWorker } from "../host/types";
 const WORKER_SOURCE = /* js */ `
 "use strict";
 
-// CDN URLs injected at build time
+// Same-origin runtime asset URLs injected at build time.
 const ESBUILD_ESM_URL = "${CDN_ESBUILD_ESM}";
 const ESBUILD_WASM_URL = "${CDN_ESBUILD_BINARY}";
 const PAKO_URL = "${CDN_PAKO}";
 
-const cdnImport = new Function("url", "return import(url)");
+const cdnImport = (url) => import(url);
 
 let esbuildEngine = null;
 let pakoModule = null;
@@ -528,9 +528,7 @@ export function createInlineWorker(): HostWorker | null {
 }
 
 // call when the pool is permanently disposed
-export function revokeInlineWorkerUrl(): void {
-  // a process worker registers no host: no worker was created, and a pool
-  // giving up on workers there must not fail the task it falls back for
+export function disposeInlineWorkerHost(): void {
   try {
     getRuntimeHost().disposeGlobalResources?.();
   } catch {

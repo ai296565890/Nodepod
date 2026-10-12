@@ -22,14 +22,14 @@ export interface HostWorker {
   removeEventListener(type: string, listener: (...args: any[]) => void): void;
   onmessage: HostWorkerMessageHandler | null;
   onerror: HostWorkerErrorHandler | null;
-  /** Set when the worker was created from an external URL (not embedded). */
+  /** Set when the worker was created from a direct URL. */
   __nodepodDirect?: boolean;
-  /** Blob / object URL to revoke when the worker is disposed (browser). */
+  /** Optional object URL owned by a host implementation. */
   __nodepodRevokeUrl?: string | null;
 }
 
 export type WorkerSpec =
-  | { type: "process"; name?: string; /** Skip external URL; use embedded/file bundle. */ embedded?: boolean }
+  | { type: "process"; name?: string; /** Use the same-origin process Worker endpoint. */ embedded?: boolean }
   | { type: "source"; source: string; name?: string }
   | { type: "url"; url: string; name?: string };
 

@@ -10,6 +10,7 @@
 //        via structured clone (Chromium/Firefox). Warm reloads skip compile.
 
 import { untrackedWasm } from "./event-loop";
+import { nodepodAssetUrl } from "./nodepod-assets";
 import { readWasmMemoryImports, rememberWasmMemoryRequirements, wasmMemoryRequirements } from "./wasm-memory-clamp";
 import {
   getWasmModuleCache,
@@ -162,25 +163,7 @@ const _pendingCompiles = new Map<
 
 function getCompileWorker(): Worker {
   if (_compileWorker) return _compileWorker;
-  const code = `
-    self.onmessage = function(e) {
-      try {
-        var mod = new WebAssembly.Module(e.data.bytes);
-        self.postMessage({ id: e.data.id, ok: true, module: mod });
-      } catch (err) {
-        self.postMessage({ id: e.data.id, ok: false, error: err.message });
-      }
-    };
-  `;
-  const url = URL.createObjectURL(
-    new Blob([code], { type: "application/javascript" }),
-  );
-  let worker: Worker;
-  try {
-    worker = new Worker(url);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  const worker = new Worker(nodepodAssetUrl("wasm-compile-worker.js"));
   worker.onmessage = (e: MessageEvent) => {
     const { id, ok, module, error } = e.data;
     const pending = _pendingCompiles.get(id);
